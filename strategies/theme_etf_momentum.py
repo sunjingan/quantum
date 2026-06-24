@@ -340,15 +340,12 @@ class RealETFUniverse:
         meta = meta[meta["is_stock_like"] & meta["is_listed"] & meta["has_index"]].copy()
         meta = meta.drop_duplicates("ts_code", keep="last")
         meta["ts_code"] = meta["ts_code"].astype(str)
-        if "list_date" in meta.columns:
-            list_date = meta["list_date"]
-        elif "setup_date" in meta.columns:
-            list_date = meta["setup_date"]
-        elif "issue_date" in meta.columns:
-            list_date = meta["issue_date"]
-        else:
-            list_date = pd.Series([pd.NA] * len(meta), index=meta.index)
-        meta["list_date"] = pd.to_datetime(list_date.astype(str), errors="coerce")
+        list_date = pd.Series([pd.NA] * len(meta), index=meta.index)
+        for col in ["list_date_x", "list_date_y", "list_date", "setup_date", "issue_date", "found_date"]:
+            if col in meta.columns:
+                list_date = list_date.fillna(meta[col])
+        list_date_clean = list_date.astype(str).str.replace(r"\.0$", "", regex=True)
+        meta["list_date"] = pd.to_datetime(list_date_clean, format="%Y%m%d", errors="coerce")
         meta["theme_name"] = meta["index_name"].fillna(meta["fund_name"]).astype(str)
         meta["code"] = meta["ts_code"].apply(tushare_to_qlib)
         return meta[["ts_code", "code", "fund_name", "theme_name", "index_code", "index_name", "list_date"]].drop_duplicates()
