@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+.matplotlib/
+data/
+env_qlib/
+qlib/
+qlib-venv/
+logs/
+mlruns/
+outputs/**/*.csv
+outputs/**/*.png
+config/tushare_token.txt

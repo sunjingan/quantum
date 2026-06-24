@@ -1,0 +1,100 @@
+# Trend-Serenity Quant Strategy — qrun YAML config
+#
+# Usage:
+#   source activate.sh
+#   qrun config/trend_serenity_qlib.yaml
+#
+# This uses qlib's SimulatorExecutor + custom TrendSerenityStrategy.
+# Results recorded to MLflow under experiment "trend_serenity_qlib".
+qlib_init:
+    provider_uri: "/Users/jingansun/Desktop/codex/quant/data/my_qlib"
+    region: cn
+
+market: &market hs300
+benchmark: &benchmark sh000300
+
+# Backtest configuration
+port_analysis_config: &port_analysis_config
+    executor:
+        class: SimulatorExecutor
+        module_path: qlib.backtest.executor
+        kwargs:
+            time_per_step: day
+            generate_portfolio_metrics: true
+    strategy:
+        class: TrendSerenityStrategy
+        module_path: strategies.trend_serenity
+        kwargs:
+            provider_uri: "/Users/jingansun/Desktop/codex/quant/data/my_qlib"
+            token_path: "/Users/jingansun/Desktop/codex/quant/config/tushare_token.txt"
+            cache_dir: "/Users/jingansun/Desktop/codex/quant/data/tushare_cache"
+            market: *market
+            benchmark: *benchmark
+            initial_cash: 500000
+            target_num: 10
+            factor_version: v2
+            use_buffer: true
+            min_list_days: 250
+            min_profit: 0.0
+            min_q_sales_yoy: 40.0
+            min_bottleneck_q_sales_yoy: 15.0
+            min_price_score: 1
+            max_pe_ttm: 200.0
+            max_debt_to_assets: 85.0
+            max_per_industry: 3
+    backtest:
+        start_time: 2018-01-02
+        end_time: 2026-06-22
+        account: 500000
+        benchmark: *benchmark
+        exchange_kwargs:
+            freq: day
+            limit_threshold: 0.095
+            deal_price: close
+            open_cost: 0.0005
+            close_cost: 0.0015
+            min_cost: 5
+
+task:
+    model:
+        class: TrendSerenityModel
+        module_path: strategies.trend_serenity
+        kwargs:
+            provider_uri: "/Users/jingansun/Desktop/codex/quant/data/my_qlib"
+            token_path: "/Users/jingansun/Desktop/codex/quant/config/tushare_token.txt"
+            cache_dir: "/Users/jingansun/Desktop/codex/quant/data/tushare_cache"
+            market: *market
+            benchmark: *benchmark
+            target_num: 10
+            factor_version: v2
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: Alpha158
+                module_path: qlib.contrib.data.handler
+                kwargs:
+                    start_time: 2015-01-04
+                    end_time: 2026-06-22
+                    fit_start_time: 2015-01-04
+                    fit_end_time: 2017-12-29
+                    instruments: *market
+            segments:
+                train: [2015-01-04, 2017-12-29]
+                test:  [2018-01-02, 2026-06-22]
+    record:
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: SigAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            ana_long_short: false
+            ann_scaler: 252
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            config: *port_analysis_config

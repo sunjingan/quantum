@@ -1,0 +1,70 @@
+# 我的第一个 Qlib 策略 — 基于上面的模板，使用本地数据
+qlib_init:
+    provider_uri: "/Users/jingansun/Desktop/codex/quant/data/my_qlib"
+    region: cn
+market: &market csi300
+benchmark: &benchmark SH000300
+
+data_handler_config: &data_handler_config
+    start_time: 2020-01-02
+    end_time: 2025-06-19
+    fit_start_time: 2020-01-02
+    fit_end_time: 2023-12-29
+    instruments: *market
+
+port_analysis_config: &port_analysis_config
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: 5
+            n_drop: 1
+    backtest:
+        start_time: 2024-01-02
+        end_time: 2025-06-19
+        account: 100000000
+        benchmark: *benchmark
+        exchange_kwargs:
+            limit_threshold: 0.095
+            deal_price: close
+            open_cost: 0.0005
+            close_cost: 0.0015
+            min_cost: 5
+
+task:
+    model:
+        class: LGBModel
+        module_path: qlib.contrib.model.gbdt
+        kwargs:
+            loss: mse
+            learning_rate: 0.1
+            max_depth: 6
+            num_leaves: 100
+            num_threads: 1
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: Alpha158
+                module_path: qlib.contrib.data.handler
+                kwargs: *data_handler_config
+            segments:
+                train: [2020-01-02, 2023-12-29]
+                test:  [2024-01-02, 2025-06-19]
+    record:
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: SigAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            ana_long_short: False
+            ann_scaler: 252
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            config: *port_analysis_config
