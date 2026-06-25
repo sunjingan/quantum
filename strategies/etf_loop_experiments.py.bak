@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+J-series experiment runner for ETF Loop strategy.
+
+J6: Tiered slippage by liquidity bucket
+J7: Capacity test with participation rate penalty
+J8: Rebalancing frequency tests
+"""
+from __future__ import annotations
+import sys, os, pickle
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from strategies.etf_loop_strategy import (
+    ETFLoopParams, ETFDailyStore, get_ranked_etfs,
+    run_etf_loop_backtest, _summarize, output_paths,
+    calculate_atr, _lot_floor,
+)
+from strategies.sector_prosperity import SectorProsperityCache
+
+
+# ── G2 PIT pool loader ──
+def load_g2_pit_pool():
+    """Load monthly PIT pools dict: {pd.Timestamp: [ts_code, ...]}."""
+    path = BASE_DIR / "data" / "tushare_cache" / "sector_prosperity" / "etf_pool_G2_PIT_monthly.pkl"
+    with open(path, 'rb') as f:
+        pools = pickle.load(f)
+    return pools
+
+
+# ── Tiered slippage (J6) ──
+def tiered_slippage(avg_amount_20d: float) -> float:
+    """Return one-sided slippage based on 20d avg daily amount."""
+    if avg_amount_20d >= 1_000_000_000:   # >= 10B
+        return 0.0001
+    elif avg_amount_20d >= 100_000_000:   # 1B-10B → actually 100M-1B → 100M
+        return 0.0002
+    elif avg_amount_20d >= 50_000_000:    # 50M-1B
+        return 0.0004
+    else:
+        return 0.0009
+
+
+# ── Participation penalty (J7) ──
+def participation_penalty(trade_value: float, daily_amount: float) -> float:
+    """Extra one-sided slippage from participation rate."""
+    if daily_amount <= 0 or trade_value <= 0:
+        return 0.0
+    p = trade_value / daily_amount
+    if p < 0.01:
+        return 0.0
+    elif p < 0.03:
+        return 0.0001
+    elif p < 0.05:
+        return 0.0003
+    else:
+        return 0.0005  # high penalty, but trade still executed with warning
+
+
+# ── J6/J7/J8 variant backtest ──
+def run_pit_backtest_variant(
+    pit_pools: dict,
+    cache_dir: Path, token_path: Path, params: ETFLoopParams,
+    use_tiered_slippage: bool = False,
+    use_participation_penalty: bool = False,
+    rebalance_interval: int = 1,  # 1=daily, 2=every 2 days, 5=weekly
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """PIT backtest with optional tiered slippage, participation penalty,
+    and rebalancing frequency control.
+    """
+    cache = SectorProsperityCache(token_path, cache_dir)
+    
+    # Build store with the union of all pools across time
+    all_pool_ts = sorted(set(c for pool in pit_pools.values() for c in pool))
+    store = ETFDailyStore(cache, all_pool_ts, params.start, params.end)
+    if not store.ts_codes:
+        raise RuntimeError("No ETF data found")
+
+    # Benchmark close
+    from strategies._utils import QlibDailyReader
+    provider_uri = Path(os.environ.get("QLIB_PROVIDER_URI", BASE_DIR / "data" / "a_share_qlib"))
+    reader = QlibDailyReader(provider_uri)
+    bench_close = reader.read_field(params.benchmark, "close")
+    bench_close = bench_close.loc[pd.Timestamp(params.start):pd.Timestamp(params.end)]
+
+    calendar = store.calendar
+    
+    # Precompute liquidity: 20d avg amount lookup per (code, date)
+    # We'll compute on-the-fly for simplicity
+    
+    def get_avg_amount_20d(code: str, date: pd.Timestamp) -> float:
+        df = store.amount
+        if code not in df.columns:
+            return 0.0
+        col = df[code].loc[:date].dropna()
+        if len(col) < 5:
+            return 0.0
+        return float(col.iloc[-min(20, len(col)):].mean())
+    
+    # Helpers for pool lookup
+    pool_months = sorted(pit_pools.keys())
+    
+    def get_active_pool(date: pd.Timestamp) -> set:
+        """Get the pool active on `date` (last month-end <= date)."""
+        for m in reversed(pool_months):
+            if m <= date:
+                return set(pit_pools[m])
+        return set(pit_pools[pool_months[0]])
+    
+    cash = params.initial_cash
+    shares: dict[str, int] = {}
+    entry_prices: dict[str, float] = {}
+    position_highs: dict[str, float] = {}
+    records: list[dict] = []
+    target_rows: list[dict] = []
+    
+    # Cooldown tracking (from J3)
+    cooldown: dict[str, int] = {}  # code → days remaining
+    cd_days = 3  # Use cd=3 as default per J3/J4
+    
+    for i, data_date in enumerate(calendar[:-1]):
+        if i < params.lookback_days:
+            continue
+        next_date = calendar[i + 1]
+        
+        # Decrement cooldown
+        for code in list(cooldown.keys()):
+            cooldown[code] -= 1
+            if cooldown[code] <= 0:
+                del cooldown[code]
+        
+        # J8: skip rebalance on non-rebalance days (still do stops)
+        do_rebalance = (i % rebalance_interval == 0)
+        
+        # ── Score & rank ETFs (always compute for stop checks) ──
+        active_pool = get_active_pool(data_date)
+        # Override store.ts_codes temp to restrict to active pool
+        temp_ts_codes = store.ts_codes
+        store.ts_codes = [c for c in temp_ts_codes if c in active_pool]
+        ranked = get_ranked_etfs(store, data_date, params)
+        store.ts_codes = temp_ts_codes
+        
+        target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num]) if do_rebalance else set()
+        
+        # ── Next-day open prices ──
+        next_open_prices = {}
+        df_open = store.open
+        for code in (target_codes | set(shares.keys())):
+            if code in df_open.columns:
+                col = df_open[code].loc[:next_date].dropna()
+                if not col.empty:
+                    next_open_prices[code] = float(col.iloc[-1])
+        
+        # ── Sell: exit positions not in target set ──
+        for code in list(shares.keys()):
+            if shares.get(code, 0) <= 0:
+                continue
+            signal_px = store.latest_price(code, data_date)
+            exec_px = next_open_prices.get(code, np.nan)
+            if np.isnan(exec_px) or exec_px <= 0:
+                exec_px = signal_px
+            if np.isnan(exec_px) or exec_px <= 0:
+                continue
+            
+            # Fixed % stop
+            stop_triggered = False
+            if code in entry_prices and signal_px <= entry_prices[code] * params.stop_loss:
+                stop_triggered = True
+            
+            # ATR stop
+            atr_triggered = False
+            if params.use_atr_stop_loss:
+                ohlc = store.ohlc_series(code, data_date, params.atr_period + 20)
+                if ohlc is not None:
+                    atr_val = calculate_atr(ohlc["high"], ohlc["low"], ohlc["close"], params.atr_period)
+                    if atr_val > 0:
+                        if params.atr_trailing_stop:
+                            high_since = position_highs.get(code, signal_px)
+                            atr_stop = high_since - params.atr_multiplier * atr_val
+                        else:
+                            atr_stop = entry_prices.get(code, signal_px) - params.atr_multiplier * atr_val
+                        if signal_px <= atr_stop:
+                            atr_triggered = True
+            
+            should_sell = (code not in target_codes) or stop_triggered or atr_triggered
+            
+            if should_sell:
+                # Compute tiered slippage
+                avg_amt = get_avg_amount_20d(code, data_date)
+                if use_tiered_slippage:
+                    slip = tiered_slippage(abs(avg_amt))
+                else:
+                    slip = params.slippage
+                
+                # Participation penalty
+                trade_val = shares[code] * exec_px
+                part_pen = participation_penalty(trade_val, avg_amt) if use_participation_penalty else 0.0
+                
+                total_slip = slip + part_pen
+                cash += shares[code] * exec_px * (1.0 - total_slip) * (1.0 - params.close_cost)
+                
+                reason = []
+                if stop_triggered:
+                    reason.append("STOP_LOSS")
+                if atr_triggered:
+                    reason.append("ATR_STOP")
+                if code not in target_codes:
+                    reason.append("RANK_OUT")
+                target_rows.append({
+                    "date": data_date, "trade_date": next_date,
+                    "ts_code": code, "action": "SELL",
+                    "reason": "|".join(reason) if reason else "REBALANCE",
+                    "price": exec_px, "shares": shares[code],
+                    "slip": slip, "part_pen": part_pen,
+                })
+                shares[code] = 0
+                entry_prices.pop(code, None)
+                position_highs.pop(code, None)
+                # Set cooldown
+                cooldown[code] = cd_days
+        
+        # ── Buy ──
+        if do_rebalance:
+            active_set = target_codes | set(c for c in shares if shares.get(c, 0) > 0)
+            if active_set:
+                n_active = max(1, len(active_set))
+                total_value = cash
+                for code in shares:
+                    if shares.get(code, 0) > 0:
+                        px = store.latest_price(code, data_date)
+                        total_value += shares[code] * (px if not np.isnan(px) and px > 0 else 0)
+                per_slot = total_value / n_active
+                
+                for code in sorted(target_codes):
+                    # Skip if in cooldown (unless Top 3 override)
+                    if code in cooldown:
+                        # Check if Top 3 -> override
+                        top3 = set(r["ts_code"] for r in ranked[:3])
+                        if code not in top3:
+                            continue
+                    
+                    px = next_open_prices.get(code, np.nan)
+                    if np.isnan(px) or px <= 0:
+                        continue
+                    current_val = shares.get(code, 0) * px
+                    diff = per_slot - current_val
+                    if diff <= 0:
+                        continue
+                    buy_cash = min(cash, diff)
+                    
+                    avg_amt = get_avg_amount_20d(code, data_date)
+                    if use_tiered_slippage:
+                        slip = tiered_slippage(abs(avg_amt))
+                    else:
+                        slip = params.slippage
+                    
+                    total_cost = params.open_cost + slip
+                    buy_shares = _lot_floor(buy_cash / (px * (1.0 + total_cost)))
+                    if buy_shares <= 0:
+                        continue
+                    
+                    # Participation penalty
+                    trade_val = buy_shares * px
+                    part_pen = participation_penalty(trade_val, avg_amt) if use_participation_penalty else 0.0
+                    
+                    if use_participation_penalty and part_pen >= 0.0005:
+                        # Skip trades with participation >5%
+                        continue
+                    
+                    total_cost += part_pen
+                    cash -= buy_shares * px * (1.0 + total_cost)
+                    
+                    if trade_val < params.min_trade_value:
+                        continue
+                    
+                    old_shares = shares.get(code, 0)
+                    shares[code] = old_shares + buy_shares
+                    if old_shares == 0:
+                        entry_prices[code] = px
+                        position_highs[code] = px
+                    else:
+                        entry_prices[code] = (old_shares * entry_prices[code] + buy_shares * px) / (old_shares + buy_shares)
+                    
+                    target_rows.append({
+                        "date": data_date, "trade_date": next_date,
+                        "ts_code": code, "action": "BUY",
+                        "reason": "RANK_IN",
+                        "price": px, "shares": buy_shares,
+                        "score": next((r["score"] for r in ranked if r["ts_code"] == code), np.nan),
+                        "slip": slip, "part_pen": part_pen,
+                    })
+        
+        # ── Update position highs ──
+        for code in shares:
+            if shares.get(code, 0) <= 0:
+                continue
+            px_close = store.latest_price(code, next_date)
+            if not np.isnan(px_close) and px_close > 0:
+                position_highs[code] = max(position_highs.get(code, px_close), px_close)
+        
+        # ── Record equity ──
+        portfolio_value = cash
+        for code in shares:
+            if shares.get(code, 0) > 0:
+                px = store.latest_price(code, next_date)
+                if not np.isnan(px) and px > 0:
+                    portfolio_value += shares[code] * px
+                else:
+                    portfolio_value += shares[code] * entry_prices.get(code, 0)
+        
+        records.append({
+            "date": next_date,
+            "portfolio_value": portfolio_value,
+            "cash": cash,
+            "position_count": sum(1 for s in shares.values() if s > 0),
+            "target_count": len(target_codes),
+        })
+    
+    equity = pd.DataFrame(records).drop_duplicates("date", keep="last").set_index("date")
+    if equity.empty:
+        raise RuntimeError("No equity records")
+    
+    if not bench_close.empty:
+        bench = bench_close.reindex(equity.index).ffill()
+        fb = bench.dropna().iloc[0]
+        equity["benchmark_value"] = params.initial_cash * bench / fb
+        equity["benchmark_return"] = equity["benchmark_value"] / equity["benchmark_value"].iloc[0] - 1.0
+    else:
+        equity["benchmark_value"] = np.nan
+        equity["benchmark_return"] = np.nan
+    
+    equity["strategy_return"] = equity["portfolio_value"] / equity["portfolio_value"].iloc[0] - 1.0
+    
+    return equity, pd.DataFrame(target_rows)
+
+
+# ── Experiment runner ──
+def run_experiment(tag: str, params_overrides: dict,
+                   pit_pools: dict, cache_dir: Path, token_path: Path,
+                   tiered: bool = False, participation: bool = False,
+                   rebalance_interval: int = 1):
+    """Run one experiment variant and save results."""
+    out_dir = BASE_DIR / "outputs" / "etf_loop"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    start = "2018-06-01"
+    end = "2026-06-25"
+    
+    params = ETFLoopParams(
+        etf_pool_ts=[],  # overridden by PIT logic
+        holdings_num=5,
+        lookback_days=25,
+        stop_loss=0.95,
+        initial_cash=500_000,
+        start=start,
+        end=end,
+        slippage=0.0001,
+        open_cost=0.0001,
+        close_cost=0.0001,
+    )
+    for k, v in params_overrides.items():
+        setattr(params, k, v)
+    
+    print(f"Running {tag}...")
+    equity, targets = run_pit_backtest_variant(
+        pit_pools, cache_dir, token_path, params,
+        use_tiered_slippage=tiered,
+        use_participation_penalty=participation,
+        rebalance_interval=rebalance_interval,
+    )
+    
+    suffix = f"{tag}_h5_{pd.Timestamp(start):%Y%m%d}_{pd.Timestamp(end):%Y%m%d}"
+    equity.to_csv(out_dir / f"etf_loop_equity_{suffix}.csv")
+    targets.to_csv(out_dir / f"etf_loop_targets_{suffix}.csv", index=False)
+    
+    stats = _summarize(equity)
+    pd.DataFrame([stats]).to_csv(out_dir / f"etf_loop_summary_{suffix}.csv", index=False)
+    
+    n_trades = len(targets)
+    print(f"  {tag}: annual={stats['annual_return']*100:.2f}%, Sharpe={stats['sharpe_ratio']:.2f}, "
+          f"DD={stats['max_drawdown']*100:.2f}%, trades={n_trades}")
+    return stats, n_trades
+
+
+def main():
+    token_path = BASE_DIR / "config" / "tushare_token.txt"
+    cache_dir = BASE_DIR / "data" / "tushare_cache"
+    
+    pit_pools = load_g2_pit_pool()
+    
+    results = {}
+    
+    # ── J6: Tiered slippage ──
+    print("\n=== J6: Tiered Slippage ===")
+    for tag, tiered_flag in [("J6_flat", False), ("J6_tiered", True)]:
+        stats, n = run_experiment(tag, {}, pit_pools, cache_dir, token_path, tiered=tiered_flag)
+        results[tag] = (stats, n)
+    
+    # ── J7: Capacity test with participation penalty ──
+    print("\n=== J7: Capacity Test ===")
+    for tag, capital in [("J7_500K", 500_000), ("J7_2M", 2_000_000),
+                          ("J7_5M", 5_000_000), ("J7_10M", 10_000_000),
+                          ("J7_30M", 30_000_000)]:
+        stats, n = run_experiment(tag, {"initial_cash": capital},
+                                  pit_pools, cache_dir, token_path,
+                                  tiered=True, participation=True)
+        results[tag] = (stats, n)
+    
+    # ── J8: Rebalancing frequency ──
+    print("\n=== J8: Rebalancing Frequency ===")
+    for tag, interval in [("J8_daily", 1), ("J8_e2d", 2),
+                            ("J8_mwf", 3), ("J8_weekly", 5)]:
+        stats, n = run_experiment(tag, {}, pit_pools, cache_dir, token_path,
+                                  rebalance_interval=interval)
+        results[tag] = (stats, n)
+    
+    # ── Summary ──
+    print("\n\n=== FINAL SUMMARY ===")
+    for tag, (stats, n) in results.items():
+        print(f"  {tag:12s} | {stats['annual_return']*100:6.2f}% | Sharpe {stats['sharpe_ratio']:.2f} | "
+              f"DD {stats['max_drawdown']*100:5.2f}% | {stats['final_value']:12.0f} | trades {n}")
+
+
+if __name__ == "__main__":
+    main()

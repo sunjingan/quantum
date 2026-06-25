@@ -27,16 +27,22 @@ from strategies._utils import (
     score_low_is_good,
     summarize,
 )
-from strategies.trend_serenity import (
-    TrendSerenityParams,
-    TrendSerenityModel,
-    TrendSerenityStrategy,
-    build_serenity_pool_v2,
-    select_targets_v2,
-    price_strength_multi_mode,
-    check_invalidation,
-)
-from strategies.trend_serenity_v2 import compute_serenity_v2, select_serenity_v2_targets
+try:
+    from strategies.trend_serenity import (
+        TrendSerenityParams,
+        TrendSerenityModel,
+        TrendSerenityStrategy,
+        build_serenity_pool_v2,
+        select_targets_v2,
+        price_strength_multi_mode,
+        check_invalidation,
+    )
+except ImportError:
+    pass
+try:
+    from strategies.trend_serenity_v2 import compute_serenity_v2, select_serenity_v2_targets
+except ImportError:
+    pass
 from strategies.sector_prosperity import (
     SectorProsperityCache,
     SectorProsperityParams,
@@ -44,13 +50,16 @@ from strategies.sector_prosperity import (
     compute_sector_scores,
     compute_stock_topic_scores,
 )
-from strategies.poe_pb_roe import (
-    POEPBRoeParams,
-    POEPBRoeModel,
-    POEPBRoeStrategy,
-    build_base_dataframe,
-    pick_targets,
-)
+try:
+    from strategies.poe_pb_roe import (
+        POEPBRoeParams,
+        POEPBRoeModel,
+        POEPBRoeStrategy,
+        build_base_dataframe,
+        pick_targets,
+    )
+except ImportError:
+    pass
 from strategies.theme_etf_momentum import (
     ThemeETFParams,
     compute_theme_scores,

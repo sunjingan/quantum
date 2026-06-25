@@ -51,6 +51,11 @@ def _date_col(df: pd.DataFrame, *names: str) -> pd.Series:
     return pd.Series(pd.NaT, index=df.index)
 
 
+def _parse_ymd_series(s: pd.Series) -> pd.Series:
+    text = s.astype(str).str.replace(r"\.0$", "", regex=True)
+    return pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+
+
 @dataclass
 class ThemeETFParams:
     initial_cash: float = 500_000.0
@@ -271,7 +276,10 @@ def _pivot_wide(df: pd.DataFrame, date_col: str, code_col: str, value_col: str) 
     if df is None or df.empty or date_col not in df.columns or code_col not in df.columns or value_col not in df.columns:
         return pd.DataFrame()
     frame = df.copy()
-    frame[date_col] = pd.to_datetime(frame[date_col].astype(str), format="%Y%m%d", errors="coerce")
+    if np.issubdtype(frame[date_col].dtype, np.datetime64):
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+    else:
+        frame[date_col] = _parse_ymd_series(frame[date_col])
     frame = frame.dropna(subset=[date_col, code_col])
     if frame.empty:
         return pd.DataFrame()
@@ -284,7 +292,10 @@ def _latest_snapshot(df: pd.DataFrame, code_col: str, date_col: str, data_date: 
     if df is None or df.empty or code_col not in df.columns or date_col not in df.columns:
         return pd.DataFrame()
     frame = df.copy()
-    frame[date_col] = pd.to_datetime(frame[date_col].astype(str), format="%Y%m%d", errors="coerce")
+    if np.issubdtype(frame[date_col].dtype, np.datetime64):
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+    else:
+        frame[date_col] = _parse_ymd_series(frame[date_col])
     frame = frame[(frame[date_col] <= data_date) & frame[code_col].notna()].copy()
     if frame.empty:
         return pd.DataFrame()
@@ -340,10 +351,11 @@ class RealETFUniverse:
         meta = meta[meta["is_stock_like"] & meta["is_listed"] & meta["has_index"]].copy()
         meta = meta.drop_duplicates("ts_code", keep="last")
         meta["ts_code"] = meta["ts_code"].astype(str)
-        list_date = pd.Series([pd.NA] * len(meta), index=meta.index)
+        list_date = pd.Series([pd.NA] * len(meta), index=meta.index, dtype="object")
         for col in ["list_date_x", "list_date_y", "list_date", "setup_date", "issue_date", "found_date"]:
             if col in meta.columns:
-                list_date = list_date.fillna(meta[col])
+                fill = meta[col].astype("object")
+                list_date = list_date.where(list_date.notna(), fill)
         list_date_clean = list_date.astype(str).str.replace(r"\.0$", "", regex=True)
         meta["list_date"] = pd.to_datetime(list_date_clean, format="%Y%m%d", errors="coerce")
         meta["theme_name"] = meta["index_name"].fillna(meta["fund_name"]).astype(str)
@@ -388,7 +400,7 @@ class RealETFStore:
 
         daily = daily.copy()
         daily["ts_code"] = daily[code_col].astype(str)
-        daily["trade_date"] = pd.to_datetime(daily["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+        daily["trade_date"] = _parse_ymd_series(daily["trade_date"])
         daily = daily[(daily["trade_date"] >= pd.Timestamp(start)) & (daily["trade_date"] <= pd.Timestamp(end))].copy()
         codes = sorted(set(universe.meta["ts_code"].astype(str).tolist()) & set(daily["ts_code"].astype(str).tolist()))
         self.codes = [tushare_to_qlib(c) for c in codes]
@@ -403,14 +415,14 @@ class RealETFStore:
         if share is not None and not share.empty and "ts_code" in share.columns and "fd_share" in share.columns:
             share = share.copy()
             share["ts_code"] = share["ts_code"].astype(str)
-            share["trade_date"] = pd.to_datetime(share["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+            share["trade_date"] = _parse_ymd_series(share["trade_date"])
             share = share[(share["trade_date"] >= pd.Timestamp(start)) & (share["trade_date"] <= pd.Timestamp(end))].copy()
             share = share[share["ts_code"].isin(codes)].copy()
             self.share = _pivot_wide(share, "trade_date", "ts_code", "fd_share").rename(columns=tushare_to_qlib)
         else:
             self.share = pd.DataFrame(index=self.close.index, columns=self.close.columns, dtype=float)
 
-        self.calendar = self.close.index.intersection(self.amount.index)
+        self.calendar = self.close.index if not self.close.empty else self.amount.index
         self.open = self.open.reindex(self.calendar)
         self.high = self.high.reindex(self.calendar)
         self.low = self.low.reindex(self.calendar)
@@ -474,6 +486,54 @@ class MoneyFlowCache:
             self._top_inst = self._load_glob(self.sector_dir, "top_inst*.csv")
         return self._top_inst
 
+    def _moneyflow_range(self, cutoff: pd.Timestamp, data_date: pd.Timestamp) -> pd.DataFrame:
+        """Load only moneyflow files that overlap with [cutoff, data_date]."""
+        parts = []
+        for path in sorted(self.enrichment_dir.glob("moneyflow*.csv")):
+            # Parse date range from filename: moneyflow_YYYYMMDD_YYYYMMDD.csv
+            stem = path.stem
+            parts_name = stem.split("_")
+            if len(parts_name) >= 3:
+                try:
+                    f_start = pd.Timestamp(parts_name[-2])
+                    f_end = pd.Timestamp(parts_name[-1])
+                except (ValueError, TypeError):
+                    f_start = f_end = None
+            else:
+                f_start = f_end = None
+            if f_start is not None and f_end is not None:
+                if f_end < cutoff or f_start > data_date:
+                    continue  # file doesn't overlap
+            try:
+                part = pd.read_csv(path, dtype={"ts_code": str})
+                if not part.empty:
+                    parts.append(part)
+            except (pd.errors.EmptyDataError, UnicodeDecodeError):
+                continue
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    def _top_inst_range(self, cutoff: pd.Timestamp, data_date: pd.Timestamp) -> pd.DataFrame:
+        """Load only top_inst files that overlap with [cutoff, data_date]."""
+        parts = []
+        # top_inst files are named top_inst_YYYYMMDD.csv
+        for path in sorted(self.sector_dir.glob("top_inst*.csv")):
+            stem = path.stem  # top_inst_20210104
+            fname_date = stem.split("_")[-1] if "_" in stem else ""
+            try:
+                f_dt = pd.Timestamp(fname_date)
+            except (ValueError, TypeError):
+                f_dt = None
+            if f_dt is not None:
+                if f_dt < cutoff or f_dt > data_date:
+                    continue
+            try:
+                part = pd.read_csv(path, dtype={"ts_code": str})
+                if not part.empty:
+                    parts.append(part)
+            except (pd.errors.EmptyDataError, UnicodeDecodeError):
+                continue
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
     def score(self, codes: list[str], data_date: pd.Timestamp, amount_5d: pd.Series) -> pd.Series:
         if not codes:
             return pd.Series(dtype=float)
@@ -482,7 +542,7 @@ class MoneyFlowCache:
         ts_to_code = dict(zip(ts_codes, codes))
         cutoff = data_date - pd.DateOffset(days=10)
 
-        mf = self.moneyflow()
+        mf = self._moneyflow_range(cutoff, data_date)
         if not mf.empty and "net_mf_amount" in mf.columns:
             dt = _date_col(mf, "trade_date", "fetch_date")
             recent = mf[(mf["ts_code"].isin(ts_codes)) & (dt <= data_date) & (dt >= cutoff)].copy()
@@ -492,7 +552,7 @@ class MoneyFlowCache:
                 ratio = raw.reindex(codes).fillna(0.0) / amount_5d.reindex(codes).replace(0, np.nan)
                 out = 0.75 * _rank01(ratio, ascending=True) + 0.25 * out
 
-        inst = self.top_inst()
+        inst = self._top_inst_range(cutoff, data_date)
         if not inst.empty:
             dt = _date_col(inst, "trade_date", "fetch_date")
             recent = inst[(inst["ts_code"].isin(ts_codes)) & (dt <= data_date) & (dt >= data_date - pd.DateOffset(days=3))].copy()
@@ -603,8 +663,10 @@ def select_themes(theme_scores: pd.DataFrame, params: ThemeETFParams) -> pd.Data
     if theme_scores.empty:
         return theme_scores
     filtered = theme_scores[theme_scores["selected_filter"]].copy()
+    # No fallback: if no themes pass the strong filter, return empty.
+    # Weak-market no-signal is a valid strategy signal.
     if filtered.empty:
-        filtered = theme_scores.head(max(params.etf_count, 1)).copy()
+        return pd.DataFrame()
     pct_n = max(1, int(np.ceil(len(theme_scores) * params.theme_top_pct)))
     return filtered.head(max(params.etf_count, pct_n)).head(params.etf_count).copy()
 

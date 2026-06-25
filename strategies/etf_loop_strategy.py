@@ -561,7 +561,9 @@ def run_etf_loop_backtest(
             exec_px = next_open_prices.get(code, np.nan)  # sell at next open
             if np.isnan(exec_px) or exec_px <= 0:
                 exec_px = signal_px  # fallback
-            if np.isnan(px) or px <= 0:
+            if np.isnan(exec_px) or exec_px <= 0:
+                exec_px = entry_prices.get(code, signal_px)
+            if np.isnan(exec_px) or exec_px <= 0:
                 continue
 
             # Fixed % stop
