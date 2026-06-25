@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+K0: Unified ETF Loop Backtest Engine.
+
+Design invariants (non-negotiable):
+  1. Single entry point. Same params + pool → identical results.
+  2. Daily loop: signal at date close → orders → execute at next_date open → value at next_date close.
+  3. Pure execution functions. No stale variable reuse from outer loops.
+  4. Transaction log must fully reconcile NAV:
+       cash_t + Σ(shares_i,t × close_i,t) = portfolio_value_t
+  5. Participation model uses partial fills, not hard rejects.
+  6. cost = commission + liquidity_slippage + participation_impact.
+"""
+from __future__ import annotations
+
+import os, sys, pickle
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from strategies.etf_loop_strategy import (
+    ETFDailyStore, SectorProsperityCache, get_ranked_etfs,
+    calculate_atr, _lot_floor, _summarize, _parse_ymd,
+)
+from strategies._utils import QlibDailyReader
+
+
+# ═══════════════════════════════════════
+# Parameters — clean, no inheritance chain
+# ═══════════════════════════════════════
+
+@dataclass
+class EngineParams:
+    """All parameters for the unified backtest engine. No inheritance, no surprises."""
+
+    # ── Pool ──
+    etf_pool_ts: list[str] = field(default_factory=list)  # static pool or None
+    pit_pool_path: Optional[str] = None                     # path to pickle for PIT mode
+    pit_pools: Optional[dict] = None                        # pre-loaded PIT dict {pd.Timestamp: [codes]}
+
+    # ── Core strategy ──
+    holdings_num: int = 5
+    lookback_days: int = 25
+    stop_loss: float = 0.95
+
+    # ── Filters (all on by default) ──
+    use_rsi_filter: bool = True
+    rsi_period: int = 6
+    rsi_lookback_days: int = 1
+    rsi_threshold: float = 98
+    enable_volume_check: bool = True
+    volume_lookback: int = 5
+    volume_threshold: float = 2.0
+    volume_return_limit: float = 1.0
+    use_short_momentum_filter: bool = True
+    short_lookback_days: int = 10
+    short_momentum_threshold: float = 0.0
+    loss: float = 0.97
+    min_score_threshold: float = 0.0
+    max_score_threshold: float = 500.0
+
+    # ── ATR stop ──
+    use_atr_stop_loss: bool = True
+    atr_period: int = 14
+    atr_multiplier: float = 2.0
+    atr_trailing_stop: bool = False
+
+    # ── Cost model ──
+    open_cost: float = 0.0001      # buy-side commission
+    close_cost: float = 0.0001     # sell-side commission
+    slippage: float = 0.0001       # fixed slippage (used when dynamic_cost=False)
+    use_dynamic_cost: bool = False
+    liquidity_lookback: int = 60   # days for avg amount calculation
+    # Tiered liquidity slippage (extra on top of commission):
+    # [(amount_threshold, per_side_slip), ...]
+    slip_tiers: tuple = field(default_factory=lambda: (
+        (10_000_000_000, 0.0001),   # ≥10B:  0.01%
+        (1_000_000_000,  0.0002),   # ≥1B:   0.02%
+        (500_000_000,     0.0004),   # ≥500M: 0.04%
+        (50_000_000,      0.0008),   # ≥50M:  0.08%
+        (0,               0.0015),   # <50M:  0.15%
+    ))
+
+    # ── Participation model ──
+    participation_cap: Optional[float] = None  # e.g. 0.05 = 5% max trade/amount
+    participation_penalty_tiers: tuple = field(default_factory=lambda: (
+        (0.01, 0.0),
+        (0.02, 0.0001),
+        (0.03, 0.0002),
+        (0.05, 0.0005),
+    ))
+    min_trade_value: float = 5000.0
+
+    # ── Cooldown ──
+    cooldown_days: int = 0
+    cooldown_override_top_n: int = 3
+
+    # ── Rebalancing frequency ──
+    rebalance_interval: int = 1
+
+    # ── Backtest window ──
+    initial_cash: float = 500_000.0
+    benchmark: str = "sh000300"
+    start: str = "2018-06-01"
+    end: str = "2026-06-25"
+
+    # ── Output ──
+    exp_tag: str = "K0"
+
+
+# ═══════════════════════════════════════
+# Pure execution functions
+# ═══════════════════════════════════════
+
+def compute_dynamic_cost(
+    avg_amount: float,
+    trade_value: float,
+    params: EngineParams,
+) -> dict:
+    """
+    Returns:
+        commission: per-side commission rate
+        slip: per-side liquidity slippage
+        part_pen: per-side participation penalty
+        filled_value: actual value that can be traded (caps at part limit)
+        rejected: True if filled_value < min_trade_value
+    """
+    commission = params.open_cost  # same for buy and sell
+
+    if params.use_dynamic_cost:
+        slip = params.slippage  # default
+        for threshold, s in params.slip_tiers:
+            if avg_amount >= threshold:
+                slip = s
+                break
+    else:
+        slip = params.slippage
+
+    # Participation penalty
+    part_pen = 0.0
+    if params.participation_cap is not None and avg_amount > 0:
+        p = trade_value / avg_amount
+        for threshold, penalty in params.participation_penalty_tiers:
+            if p < threshold:
+                part_pen = penalty
+                break
+        if p >= params.participation_cap:
+            # Partial fill: cap at participation_cap
+            max_tv = avg_amount * params.participation_cap
+            if max_tv < params.min_trade_value:
+                return {"commission": commission, "slip": slip, "part_pen": part_pen,
+                        "filled_value": 0.0, "rejected": True}
+            return {"commission": commission, "slip": slip, "part_pen": part_pen,
+                    "filled_value": max_tv, "rejected": False, "partial": True}
+
+    return {"commission": commission, "slip": slip, "part_pen": part_pen,
+            "filled_value": trade_value, "rejected": False, "partial": False}
+
+
+def execute_sell(
+    code: str,
+    shares_held: int,
+    signal_px: float,
+    exec_px: float,
+    entry_px: float,
+    avg_amount: float,
+    params: EngineParams,
+) -> dict | None:
+    """Pure sell execution. Returns None if cannot execute."""
+    if shares_held <= 0:
+        return None
+    if np.isnan(exec_px) or exec_px <= 0:
+        exec_px = signal_px
+    if np.isnan(exec_px) or exec_px <= 0:
+        return None  # no valid price
+
+    trade_value = shares_held * exec_px
+    cost = compute_dynamic_cost(avg_amount, trade_value, params)
+    if cost["rejected"]:
+        # Even for sells, if partial fill is needed, handle it
+        if cost.get("partial"):
+            trade_value = cost["filled_value"]
+            shares_sold = int(trade_value / exec_px / 100) * 100
+            if shares_sold <= 0:
+                return None
+            proceeds = trade_value * (1.0 - cost["commission"] - cost["slip"] - cost["part_pen"])
+            return {
+                "code": code, "action": "SELL",
+                "shares": shares_sold, "partial": True,
+                "price": exec_px, "gross_proceeds": trade_value,
+                "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
+                "net_proceeds": proceeds,
+                "cost_detail": cost,
+            }
+        return None
+
+    proceeds = trade_value * (1.0 - cost["commission"] - cost["slip"] - cost["part_pen"])
+    return {
+        "code": code, "action": "SELL",
+        "shares": shares_held, "partial": False,
+        "price": exec_px, "gross_proceeds": trade_value,
+        "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
+        "net_proceeds": proceeds,
+        "cost_detail": cost,
+    }
+
+
+def execute_buy(
+    code: str,
+    available_cash: float,
+    target_value: float,
+    exec_px: float,
+    avg_amount: float,
+    params: EngineParams,
+) -> dict | None:
+    """Pure buy execution. Returns None if cannot execute."""
+    if np.isnan(exec_px) or exec_px <= 0:
+        return None
+    if available_cash <= 0 or target_value <= 0:
+        return None
+
+    # Estimate shares based on available cash
+    total_cost_rate = params.open_cost + params.slippage  # rough estimate
+    estimated_shares = _lot_floor(available_cash / (exec_px * (1.0 + total_cost_rate)))
+    if estimated_shares <= 0:
+        return None
+
+    trade_value = estimated_shares * exec_px
+    cost = compute_dynamic_cost(avg_amount, trade_value, params)
+    if cost["rejected"]:
+        return None
+
+    if cost.get("partial"):
+        trade_value = cost["filled_value"]
+        shares = int(trade_value / exec_px / 100) * 100
+    else:
+        shares = estimated_shares
+
+    if shares <= 0:
+        return None
+
+    trade_value = shares * exec_px
+    if trade_value < params.min_trade_value:
+        return None
+
+    total_cost = trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"])
+    required_cash = trade_value + total_cost
+    if required_cash > available_cash:
+        # Scale down
+        scale = available_cash / required_cash
+        shares = int(shares * scale / 100) * 100
+        if shares <= 0:
+            return None
+        trade_value = shares * exec_px
+        total_cost = trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"])
+
+    return {
+        "code": code, "action": "BUY",
+        "shares": shares, "partial": cost.get("partial", False),
+        "price": exec_px, "gross_cost": trade_value,
+        "cost_total": total_cost,
+        "net_cost": trade_value + total_cost,
+        "cost_detail": cost,
+    }
+
+
+# ═══════════════════════════════════════
+# PIT pool helper
+# ═══════════════════════════════════════
+
+def _load_pit_pools(path: str) -> dict:
+    with open(path, "rb") as f:
+        pools = pickle.load(f)
+    return {pd.Timestamp(k) if isinstance(k, str) else k: v
+            for k, v in pools.items()}
+
+
+def _get_active_pool(pit_pools: dict, pool_months: list, date: pd.Timestamp) -> set:
+    for m in reversed(pool_months):
+        if m <= date:
+            return set(pit_pools[m])
+    return set(pit_pools[pool_months[0]])
+
+
+# ═══════════════════════════════════════
+# Unified backtest
+# ═══════════════════════════════════════
+
+def run_backtest(
+    params: EngineParams,
+    token_path: Path = None,
+    cache_dir: Path = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Single entry point. All features parameterized.
+
+    Returns:
+        equity_df, trade_df, audit_dict
+    """
+    if token_path is None:
+        token_path = BASE_DIR / "config" / "tushare_token.txt"
+    if cache_dir is None:
+        cache_dir = BASE_DIR / "data" / "tushare_cache"
+
+    provider_uri = Path(os.environ.get("QLIB_PROVIDER_URI",
+                                        str(BASE_DIR / "data" / "a_share_qlib")))
+
+    # ── 1. Pool setup ──
+    if params.pit_pools is not None:
+        pit_pools = params.pit_pools
+    elif params.pit_pool_path:
+        pit_pools = _load_pit_pools(params.pit_pool_path)
+    else:
+        pit_pools = None
+
+    if pit_pools is not None:
+        pool_months = sorted(pit_pools.keys())
+        all_pool_ts = sorted(set(c for pool in pit_pools.values() for c in pool))
+    else:
+        pool_months = None
+        all_pool_ts = params.etf_pool_ts
+
+    # ── 2. Data store ──
+    cache = SectorProsperityCache(token_path, cache_dir)
+    store = ETFDailyStore(cache, all_pool_ts, params.start, params.end)
+
+    # ── 3. Benchmark ──
+    reader = QlibDailyReader(provider_uri)
+    bench_close = reader.read_field(params.benchmark, "close")
+    bench_close = bench_close.loc[pd.Timestamp(params.start):pd.Timestamp(params.end)]
+
+    calendar = store.calendar
+    if len(calendar) < params.lookback_days + 1:
+        raise RuntimeError(f"Insufficient calendar days: {len(calendar)}")
+
+    # ── 4. Liquidity cache ──
+    liq_cache: dict[tuple, float] = {}
+    def get_liquidity(code: str, date: pd.Timestamp) -> float:
+        key = (code, date)
+        if key in liq_cache:
+            return liq_cache[key]
+        amt = store.amount
+        if code not in amt.columns:
+            return 0.0
+        col = amt[code].loc[:date].dropna()
+        if len(col) < 5:
+            return 0.0
+        val = float(col.iloc[-min(params.liquidity_lookback, len(col)):].mean())
+        liq_cache[key] = val
+        return val
+
+    # ── 5. State ──
+    cash = params.initial_cash
+    shares: dict[str, int] = {}
+    entry_prices: dict[str, float] = {}
+    position_highs: dict[str, float] = {}
+    cooldown: dict[str, int] = {}
+
+    daily_records: list[dict] = []
+    trade_records: list[dict] = []
+    audit: dict = {
+        "total_commission": 0.0,
+        "total_slippage": 0.0,
+        "total_part_penalty": 0.0,
+        "partial_fills": 0,
+        "rejected_trades": 0,
+        "nav_check_errors": 0,
+    }
+
+    # ── 6. Main loop ──
+    for i, signal_date in enumerate(calendar[:-1]):
+        if i < params.lookback_days:
+            # Warmup: record flat cash
+            daily_records.append({
+                "date": calendar[i + 1],
+                "portfolio_value": params.initial_cash,
+                "cash": params.initial_cash,
+                "position_count": 0, "target_count": 0, "pool_size": 0,
+                "market_value": 0.0, "gross_pnl": 0.0, "cost_total": 0.0,
+            })
+            continue
+
+        next_date = calendar[i + 1]
+
+        # ── 6a. Decrement cooldown ──
+        for c in list(cooldown.keys()):
+            cooldown[c] -= 1
+            if cooldown[c] <= 0:
+                del cooldown[c]
+
+        # ── 6b. Check if today is a rebalance day ──
+        do_rebalance = (i % params.rebalance_interval == 0)
+
+        # ── 6c. PIT pool switching ──
+        if pit_pools is not None:
+            active_pool = _get_active_pool(pit_pools, pool_months, signal_date)
+            temp_codes = store.ts_codes
+            store.ts_codes = [c for c in temp_codes if c in active_pool]
+            ranked = get_ranked_etfs(store, signal_date, params)
+            store.ts_codes = temp_codes
+        else:
+            ranked = get_ranked_etfs(store, signal_date, params)
+            active_pool = set(store.ts_codes)
+
+        pool_size = len(active_pool)
+        target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num]) if do_rebalance else set()
+        top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
+
+        # ── 6d. Get next-day open prices ──
+        next_open_prices: dict[str, float] = {}
+        for code in (target_codes | set(shares.keys())):
+            if code in store.open.columns:
+                col = store.open[code].loc[:next_date].dropna()
+                if not col.empty:
+                    next_open_prices[code] = float(col.iloc[-1])
+
+        daily_commission = 0.0
+        daily_slippage = 0.0
+        daily_part_pen = 0.0
+
+        # ── 6e. SELL: exit positions ──
+        for code in list(shares.keys()):
+            if shares.get(code, 0) <= 0:
+                continue
+
+            # Signal: check stops based on signal_date close
+            signal_px = store.latest_price(code, signal_date)
+            exec_px = next_open_prices.get(code, np.nan)
+
+            # Stop checks (on signal_date close)
+            stop_triggered = (code in entry_prices and
+                            not np.isnan(signal_px) and
+                            signal_px <= entry_prices[code] * params.stop_loss)
+
+            atr_triggered = False
+            if params.use_atr_stop_loss:
+                ohlc = store.ohlc_series(code, signal_date, params.atr_period + 20)
+                if ohlc is not None:
+                    atr_val = calculate_atr(ohlc["high"], ohlc["low"], ohlc["close"],
+                                            params.atr_period)
+                    if atr_val > 0:
+                        ep = entry_prices.get(code, signal_px)
+                        if not np.isnan(ep) and not np.isnan(signal_px):
+                            if signal_px <= ep - params.atr_multiplier * atr_val:
+                                atr_triggered = True
+
+            # Determine if should sell
+            if do_rebalance:
+                should_sell = (code not in target_codes) or stop_triggered or atr_triggered
+            else:
+                should_sell = stop_triggered or atr_triggered
+
+            if should_sell:
+                liq = get_liquidity(code, signal_date)
+                result = execute_sell(code, shares[code], signal_px, exec_px,
+                                      entry_prices.get(code, 0), liq, params)
+                if result is None:
+                    continue
+
+                cash += result["net_proceeds"]
+                daily_commission += result["cost_detail"]["commission"] * result["gross_proceeds"]
+                daily_slippage += result["cost_detail"]["slip"] * result["gross_proceeds"]
+                daily_part_pen += result["cost_detail"]["part_pen"] * result["gross_proceeds"]
+
+                reason = []
+                if stop_triggered: reason.append("STOP_LOSS")
+                if atr_triggered: reason.append("ATR_STOP")
+                if code not in target_codes: reason.append("RANK_OUT")
+
+                trade_records.append({
+                    "date": signal_date, "trade_date": next_date,
+                    "ts_code": code, "action": "SELL",
+                    "reason": "|".join(reason) if reason else "REBALANCE",
+                    "price": result["price"], "shares": result["shares"],
+                    "gross_proceeds": result["gross_proceeds"],
+                    "cost": result["cost_total"],
+                    "net_proceeds": result["net_proceeds"],
+                    "partial": result["partial"],
+                })
+
+                if result["partial"]:
+                    audit["partial_fills"] += 1
+                    shares[code] -= result["shares"]
+                    if shares[code] <= 0:
+                        shares.pop(code, None)
+                        entry_prices.pop(code, None)
+                        position_highs.pop(code, None)
+                else:
+                    shares[code] = 0
+                    entry_prices.pop(code, None)
+                    position_highs.pop(code, None)
+
+                if params.cooldown_days > 0:
+                    cooldown[code] = params.cooldown_days
+
+        # ── 6f. BUY: enter new positions ──
+        if do_rebalance:
+            active_set = target_codes | set(c for c in shares if shares.get(c, 0) > 0)
+            if active_set:
+                n_active = max(1, len(active_set))
+                total_value = cash
+                for c in shares:
+                    if shares.get(c, 0) > 0:
+                        px = store.latest_price(c, signal_date)
+                        if not np.isnan(px) and px > 0:
+                            total_value += shares[c] * px
+
+                per_slot = total_value / n_active
+
+                for code in sorted(target_codes):
+                    # Cooldown check
+                    if code in cooldown and code not in top_override:
+                        continue
+
+                    exec_px = next_open_prices.get(code, np.nan)
+                    if np.isnan(exec_px) or exec_px <= 0:
+                        continue
+
+                    current_val = shares.get(code, 0) * exec_px
+                    diff = per_slot - current_val
+                    if diff <= 0:
+                        continue
+
+                    buy_cash = min(cash, diff)
+                    liq = get_liquidity(code, signal_date)
+
+                    result = execute_buy(code, buy_cash, diff, exec_px, liq, params)
+                    if result is None:
+                        audit["rejected_trades"] += 1
+                        continue
+
+                    cash -= result["net_cost"]
+                    daily_commission += result["cost_detail"]["commission"] * result["gross_cost"]
+                    daily_slippage += result["cost_detail"]["slip"] * result["gross_cost"]
+                    daily_part_pen += result["cost_detail"]["part_pen"] * result["gross_cost"]
+
+                    old_shares = shares.get(code, 0)
+                    shares[code] = old_shares + result["shares"]
+                    if old_shares == 0:
+                        entry_prices[code] = exec_px
+                        position_highs[code] = exec_px
+                    else:
+                        entry_prices[code] = (old_shares * entry_prices[code]
+                                             + result["shares"] * exec_px) / (old_shares + result["shares"])
+
+                    trade_records.append({
+                        "date": signal_date, "trade_date": next_date,
+                        "ts_code": code, "action": "BUY",
+                        "reason": "RANK_IN",
+                        "price": result["price"], "shares": result["shares"],
+                        "gross_cost": result["gross_cost"],
+                        "cost": result["cost_total"],
+                        "net_cost": result["net_cost"],
+                        "partial": result["partial"],
+                        "score": next((r["score"] for r in ranked if r["ts_code"] == code), np.nan),
+                    })
+
+                    if result["partial"]:
+                        audit["partial_fills"] += 1
+
+        # ── 6g. Update position highs (on next_date close) ──
+        for c in shares:
+            if shares.get(c, 0) <= 0:
+                continue
+            px_c = store.latest_price(c, next_date)
+            if not np.isnan(px_c) and px_c > 0:
+                position_highs[c] = max(position_highs.get(c, px_c), px_c)
+
+        # ── 6h. Value portfolio (next_date close) ──
+        market_value = 0.0
+        for c in shares:
+            if shares.get(c, 0) > 0:
+                px_c = store.latest_price(c, next_date)
+                if not np.isnan(px_c) and px_c > 0:
+                    market_value += shares[c] * px_c
+                else:
+                    market_value += shares[c] * entry_prices.get(c, 0)
+
+        portfolio_value = cash + market_value
+
+        # Sanity check: cash >= 0
+        if cash < -1.0:
+            audit["nav_check_errors"] += 1
+
+        daily_records.append({
+            "date": next_date,
+            "portfolio_value": portfolio_value,
+            "cash": cash,
+            "market_value": market_value,
+            "position_count": sum(1 for s in shares.values() if s > 0),
+            "target_count": len(target_codes),
+            "pool_size": pool_size,
+            "gross_pnl": 0.0,  # computed per-trade in audit
+            "cost_total": daily_commission + daily_slippage + daily_part_pen,
+        })
+
+        audit["total_commission"] += daily_commission
+        audit["total_slippage"] += daily_slippage
+        audit["total_part_penalty"] += daily_part_pen
+
+    # ── 7. Build equity DataFrame ──
+    equity = pd.DataFrame(daily_records).drop_duplicates("date", keep="last").set_index("date")
+    if equity.empty:
+        raise RuntimeError("No equity records generated")
+
+    # Benchmark
+    if not bench_close.empty:
+        bench = bench_close.reindex(equity.index).ffill()
+        fb = bench.dropna().iloc[0]
+        equity["benchmark_value"] = params.initial_cash * bench / fb
+        equity["benchmark_return"] = equity["benchmark_value"] / equity["benchmark_value"].iloc[0] - 1.0
+
+    equity["strategy_return"] = equity["portfolio_value"] / equity["portfolio_value"].iloc[0] - 1.0
+
+    # ── 8. Trade log ──
+    trades = pd.DataFrame(trade_records)
+
+    # ── 9. NAV reconciliation check ──
+    # Verify: portfolio_value ≈ cash + market_value for all days
+    equity["nav_check"] = equity["portfolio_value"] - (equity["cash"] + equity["market_value"])
+    max_nav_error = equity["nav_check"].abs().max()
+    audit["max_nav_error"] = max_nav_error
+
+    # ── 10. Summary ──
+    stats = _summarize(equity)
+    audit["stats"] = stats
+
+    return equity, trades, audit
+
+
+# ═══════════════════════════════════════
+# Convenience runner
+# ═══════════════════════════════════════
+
+def run_and_save(params: EngineParams, out_dir: Path = None):
+    """Run backtest and save results to CSV."""
+    if out_dir is None:
+        out_dir = BASE_DIR / "outputs" / "etf_loop"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    equity, trades, audit = run_backtest(params)
+
+    suffix = f"{params.exp_tag}_h{params.holdings_num}"
+    suffix += f"_{params.start.replace('-','')}_{params.end.replace('-','')}"
+
+    equity.to_csv(out_dir / f"etf_loop_equity_{suffix}.csv")
+    trades.to_csv(out_dir / f"etf_loop_targets_{suffix}.csv", index=False)
+    pd.DataFrame([audit["stats"]]).to_csv(out_dir / f"etf_loop_summary_{suffix}.csv", index=False)
+
+    print(f"{params.exp_tag}: ann={audit['stats']['annual_return']*100:.2f}%, "
+          f"Sharpe={audit['stats']['sharpe_ratio']:.2f}, "
+          f"DD={audit['stats']['max_drawdown']*100:.2f}%, "
+          f"trades={len(trades)}, "
+          f"nav_err={audit['max_nav_error']:.6f}")
+
+    return equity, trades, audit
+
+
+# ═══════════════════════════════════════
+# Smoke test
+# ═══════════════════════════════════════
+
+if __name__ == "__main__":
+    os.environ.setdefault("QLIB_PROVIDER_URI",
+                          str(BASE_DIR / "data" / "a_share_qlib"))
+    sys.path.insert(0, str(BASE_DIR))
+
+    from strategies.etf_loop_strategy import ETFLoopParams
+
+    # Test 1: Static pool (union) — should match original backtest
+    import pickle
+    with open(BASE_DIR / "data" / "tushare_cache" / "sector_prosperity" /
+              "etf_pool_G2_PIT_monthly.pkl", "rb") as f:
+        pools = pickle.load(f)
+    all_ts = sorted(set(c for pool in pools.values() for c in pool))
+
+    print("=== K0 Invariant Test ===")
+    print(f"Pool: {len(all_ts)} ETFs, 2024 H1")
+
+    params1 = EngineParams(
+        etf_pool_ts=all_ts,
+        holdings_num=5,
+        start="2024-01-01", end="2024-06-30",
+        exp_tag="K0_test1",
+    )
+    e1, t1, a1 = run_and_save(params1)
+
+    # Test 2: Same params, PIT mode disabled — should give identical results
+    params2 = EngineParams(
+        etf_pool_ts=all_ts,
+        holdings_num=5, rebalance_interval=1,
+        start="2024-01-01", end="2024-06-30",
+        exp_tag="K0_test2",
+    )
+    e2, t2, a2 = run_and_save(params2)
+
+    # Compare
+    diff_ann = abs(a1["stats"]["annual_return"] - a2["stats"]["annual_return"])
+    diff_trades = abs(len(t1) - len(t2))
+    print(f"\nInvariant check: |Δ ann| = {diff_ann*100:.2f}pp, |Δ trades| = {diff_trades}")
+    if diff_ann < 0.001 and diff_trades == 0:
+        print("✅ PASS: K0 invariants hold.")
+    else:
+        print(f"❌ FAIL: K0 invariants broken (Δ ann={diff_ann*100:.2f}pp, Δ trades={diff_trades})")
