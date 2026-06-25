@@ -42,7 +42,11 @@ class EngineParams:
     # ── Pool ──
     etf_pool_ts: list[str] = field(default_factory=list)  # static pool or None
     pit_pool_path: Optional[str] = None                     # path to pickle for PIT mode
-    pit_pools: Optional[dict] = None                        # pre-loaded PIT dict {pd.Timestamp: [codes]}
+    pit_pools: Optional[dict] = None                        # pre-loaded PIT dict
+    core_pool: Optional[list[str]] = None                  # static core pool for dual-pool mode
+    use_dynamic_pool: bool = False                         # add PIT liquidity pool on top of core/pit
+    dynamic_top_n: int = 100
+    dynamic_min_amount: float = 50_000_000
 
     # ── Core strategy ──
     holdings_num: int = 5
@@ -292,6 +296,23 @@ def _get_active_pool(pit_pools: dict, pool_months: list, date: pd.Timestamp) -> 
 # Unified backtest
 # ═══════════════════════════════════════
 
+def _build_dynamic_pool(store, date, top_n=100, min_amount=50_000_000):
+    """PIT dynamic liquidity pool: top N ETFs by 5d avg amount > min_amount."""
+    scores = []
+    amt = store.amount
+    for code in store.ts_codes:
+        if code not in amt.columns:
+            continue
+        col = amt[code].loc[:date].dropna()
+        if len(col) < 5:
+            continue
+        avg = float(col.iloc[-5:].mean())
+        if avg >= min_amount:
+            scores.append((code, avg))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return set(code for code, _ in scores[:top_n])
+
+
 def run_backtest(
     params: EngineParams,
     token_path: Path = None,
@@ -397,13 +418,30 @@ def run_backtest(
         # ── 6b. Check if today is a rebalance day ──
         do_rebalance = (i % params.rebalance_interval == 0)
 
-        # ── 6c. PIT pool switching ──
+        # ── 6c. PIT pool switching + dual-pool fusion ──
         if pit_pools is not None:
             active_pool = _get_active_pool(pit_pools, pool_months, signal_date)
             temp_codes = store.ts_codes
             store.ts_codes = [c for c in temp_codes if c in active_pool]
+            # Add dynamic pool if enabled
+            if params.use_dynamic_pool:
+                dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
+                store.ts_codes = list(set(store.ts_codes) | dyn)
             ranked = get_ranked_etfs(store, signal_date, params)
             store.ts_codes = temp_codes
+        elif params.core_pool is not None:
+            # Dual-pool mode: static core + dynamic
+            core_set = set(params.core_pool) & set(store.ts_codes)
+            if params.use_dynamic_pool:
+                dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
+                active_set = core_set | dyn
+            else:
+                active_set = core_set
+            temp_codes = store.ts_codes
+            store.ts_codes = list(active_set)
+            ranked = get_ranked_etfs(store, signal_date, params)
+            store.ts_codes = temp_codes
+            active_pool = active_set
         else:
             ranked = get_ranked_etfs(store, signal_date, params)
             active_pool = set(store.ts_codes)
