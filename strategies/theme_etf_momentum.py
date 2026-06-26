@@ -457,6 +457,8 @@ class MoneyFlowCache:
         self.sector_dir = cache_dir / "sector_prosperity"
         self._moneyflow: pd.DataFrame | None = None
         self._top_inst: pd.DataFrame | None = None
+        self._mf_file_cache: dict[str, pd.DataFrame] = {}
+        self._ti_file_cache: dict[str, pd.DataFrame] = {}
 
     def _load_glob(self, directory: Path, pattern: str) -> pd.DataFrame:
         parts = []
@@ -487,10 +489,10 @@ class MoneyFlowCache:
         return self._top_inst
 
     def _moneyflow_range(self, cutoff: pd.Timestamp, data_date: pd.Timestamp) -> pd.DataFrame:
-        """Load only moneyflow files that overlap with [cutoff, data_date]."""
+        """Load only moneyflow files that overlap with [cutoff, data_date].
+        Files are cached in memory after first read to avoid repeated I/O."""
         parts = []
         for path in sorted(self.enrichment_dir.glob("moneyflow*.csv")):
-            # Parse date range from filename: moneyflow_YYYYMMDD_YYYYMMDD.csv
             stem = path.stem
             parts_name = stem.split("_")
             if len(parts_name) >= 3:
@@ -503,21 +505,26 @@ class MoneyFlowCache:
                 f_start = f_end = None
             if f_start is not None and f_end is not None:
                 if f_end < cutoff or f_start > data_date:
-                    continue  # file doesn't overlap
-            try:
-                part = pd.read_csv(path, dtype={"ts_code": str})
-                if not part.empty:
-                    parts.append(part)
-            except (pd.errors.EmptyDataError, UnicodeDecodeError):
-                continue
+                    continue
+            # Use file-level cache: each file read only once
+            path_str = str(path)
+            if path_str not in self._mf_file_cache:
+                try:
+                    df = pd.read_csv(path, dtype={"ts_code": str})
+                    self._mf_file_cache[path_str] = df if not df.empty else pd.DataFrame()
+                except (pd.errors.EmptyDataError, UnicodeDecodeError):
+                    self._mf_file_cache[path_str] = pd.DataFrame()
+            part = self._mf_file_cache[path_str]
+            if not part.empty:
+                parts.append(part)
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     def _top_inst_range(self, cutoff: pd.Timestamp, data_date: pd.Timestamp) -> pd.DataFrame:
-        """Load only top_inst files that overlap with [cutoff, data_date]."""
+        """Load only top_inst files that overlap with [cutoff, data_date].
+        Files are cached in memory after first read to avoid repeated I/O."""
         parts = []
-        # top_inst files are named top_inst_YYYYMMDD.csv
         for path in sorted(self.sector_dir.glob("top_inst*.csv")):
-            stem = path.stem  # top_inst_20210104
+            stem = path.stem
             fname_date = stem.split("_")[-1] if "_" in stem else ""
             try:
                 f_dt = pd.Timestamp(fname_date)
@@ -526,12 +533,17 @@ class MoneyFlowCache:
             if f_dt is not None:
                 if f_dt < cutoff or f_dt > data_date:
                     continue
-            try:
-                part = pd.read_csv(path, dtype={"ts_code": str})
-                if not part.empty:
-                    parts.append(part)
-            except (pd.errors.EmptyDataError, UnicodeDecodeError):
-                continue
+            # Use file-level cache
+            path_str = str(path)
+            if path_str not in self._ti_file_cache:
+                try:
+                    df = pd.read_csv(path, dtype={"ts_code": str})
+                    self._ti_file_cache[path_str] = df if not df.empty else pd.DataFrame()
+                except (pd.errors.EmptyDataError, UnicodeDecodeError):
+                    self._ti_file_cache[path_str] = pd.DataFrame()
+            part = self._ti_file_cache[path_str]
+            if not part.empty:
+                parts.append(part)
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     def score(self, codes: list[str], data_date: pd.Timestamp, amount_5d: pd.Series) -> pd.Series:

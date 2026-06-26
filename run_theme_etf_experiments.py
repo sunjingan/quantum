@@ -225,11 +225,11 @@ def _exit_reasons(
     return reasons
 
 
-def _select_random_targets(ctx: BacktestContext, data_date: pd.Timestamp, n: int = 5) -> pd.DataFrame:
+def _select_random_targets(ctx: BacktestContext, data_date: pd.Timestamp, n: int = 5, seed: int = 0) -> pd.DataFrame:
     codes = [c for c in ctx.stock_codes if c in ctx.store.close.columns]
     if not codes:
         return pd.DataFrame()
-    rng = np.random.default_rng(int(data_date.strftime("%Y%m%d")))
+    rng = np.random.default_rng(int(data_date.strftime("%Y%m%d")) + seed)
     chosen = rng.choice(codes, size=min(n, len(codes)), replace=False).tolist()
     return pd.DataFrame({"code": chosen, "weight": 1.0 / max(len(chosen), 1)})
 
@@ -551,7 +551,7 @@ def _build_context(market: str, start: str, end: str, params: SuiteParams, load_
     else:
         real_universe = RealETFUniverse(sector_cache)
         etf_store = None
-    return BacktestContext(
+    ctx = BacktestContext(
         provider_uri=PROVIDER_URI,
         cache_dir=CACHE_DIR,
         token_path=TOKEN_PATH,
@@ -573,6 +573,8 @@ def _build_context(market: str, start: str, end: str, params: SuiteParams, load_
         etf_store=etf_store,
         sector_cache=sector_cache,
     )
+    ctx._a0_seed = getattr(params, '_a0_seed', 0)
+    return ctx
 
 
 def _run_weighted_backtest(ctx: BacktestContext, exp: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -614,7 +616,7 @@ def _run_weighted_backtest(ctx: BacktestContext, exp: str) -> tuple[pd.DataFrame
 
         if exp.startswith("a"):
             if exp == "a0":
-                targets = _select_random_targets(ctx, data_date, 5)
+                targets = _select_random_targets(ctx, data_date, 5, seed=getattr(ctx, '_a0_seed', 0))
             elif exp == "a1":
                 targets = _select_momentum_targets(ctx, data_date, 5)
             else:
@@ -634,12 +636,12 @@ def _run_weighted_backtest(ctx: BacktestContext, exp: str) -> tuple[pd.DataFrame
         next_open = ctx.store.open.loc[next_date]
         signal_close = ctx.store.close.loc[data_date]
         next_close = ctx.store.close.loc[next_date]
-        market_scale = _apply_market_scale(ctx, data_date) if exp in {"c5", "d3", "d4"} else 1.0
+        market_scale = _apply_market_scale(ctx, data_date) if exp in {"c5", "d3", "d4", "d5"} else 1.0
 
         # Sell
         for code in shares[shares > 0].index.tolist():
             theme = code_theme.get(code, "UNKNOWN")
-            TRAILING_EXPS = {"r1", "r3", "c2", "c3", "c4", "c5", "c6", "c7", "c7a", "c7b", "c7c", "d3", "d4"}
+            TRAILING_EXPS = {"r1", "r3", "c2", "c3", "c4", "c5", "c6", "c7", "c7a", "c7b", "c7c", "d3", "d4", "d5"}
             STALE_FIX_EXPS = {"r2", "r3", "c2", "c3", "c4", "c5", "c6", "c7", "c7a", "c7b", "c7c"}
             trailing_activation = ctx.params.trailing_activation if exp in TRAILING_EXPS else None
             stale_fix = exp in STALE_FIX_EXPS
@@ -829,6 +831,7 @@ def main() -> None:
     parser.add_argument("--target-num", type=int, default=5)
     parser.add_argument("--etf-count", type=int, default=5)
     parser.add_argument("--rs-top-pct", type=float, default=None, help="Override rs_top_pct (default 0.20)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed override for A0 experiment")
     parser.add_argument("--no-moneyflow", action="store_true", default=False)
     parser.add_argument("--skip-real-etf", action="store_true", default=False)
     args = parser.parse_args()
@@ -842,6 +845,8 @@ def main() -> None:
     if args.rs_top_pct is not None:
         params.rs_top_pct = args.rs_top_pct
     experiments = [e.strip().lower() for e in args.experiments.split(",") if e.strip()]
+    if args.seed is not None:
+        params._a0_seed = args.seed
     load_real_etf = any(e.startswith("d") for e in experiments) and not args.skip_real_etf
     ctx = _build_context(args.market, args.start, args.end, params, load_real_etf=load_real_etf)
     out_root = BASE_DIR / "outputs" / "theme_etf_experiments"
