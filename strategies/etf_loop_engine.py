@@ -126,6 +126,15 @@ class EngineParams:
     mr_threshold: float = 1.3         # price/MA ratio threshold
     mr_penalty: float = 0.5            # score multiplier when price/MA >= threshold
 
+    # ── Permanent hold / dip-add overlay ──
+    permanent_hold_codes: tuple[str, ...] = field(default_factory=tuple)
+    permanent_hold_disable_stops: bool = True
+    permanent_dip_add_enabled: bool = False
+    permanent_dip_threshold: float = 0.10
+    permanent_dip_add_weight: float = 0.05
+    permanent_max_weight: float = 0.40
+    permanent_add_cooldown_days: int = 20
+
     # ── Backtest window ──
     initial_cash: float = 500_000.0
     benchmark: str = "sh000300"
@@ -492,6 +501,8 @@ def run_backtest(
     entry_prices: dict[str, float] = {}
     position_highs: dict[str, float] = {}
     cooldown: dict[str, int] = {}
+    permanent_hold_codes = set(params.permanent_hold_codes or ())
+    permanent_add_cooldown: dict[str, int] = {}
 
     daily_records: list[dict] = []
     trade_records: list[dict] = []
@@ -524,6 +535,10 @@ def run_backtest(
             cooldown[c] -= 1
             if cooldown[c] <= 0:
                 del cooldown[c]
+        for c in list(permanent_add_cooldown.keys()):
+            permanent_add_cooldown[c] -= 1
+            if permanent_add_cooldown[c] <= 0:
+                del permanent_add_cooldown[c]
 
         # ── 6b. Check if today is a rebalance day ──
         do_rebalance = (i % params.rebalance_interval == 0)
@@ -650,6 +665,13 @@ def run_backtest(
             else:
                 should_sell = stop_triggered or atr_triggered
 
+            is_permanent_hold = code in permanent_hold_codes and shares.get(code, 0) > 0
+            if is_permanent_hold:
+                if params.permanent_hold_disable_stops:
+                    should_sell = False
+                else:
+                    should_sell = stop_triggered or atr_triggered
+
             if should_sell:
                 liq = get_liquidity(code, signal_date)
                 result = execute_sell(code, shares[code], signal_px, exec_px,
@@ -678,6 +700,8 @@ def run_backtest(
                     "partial": result["partial"],
                     "target_weight": target_weights.get(code, 0.0),
                     "is_dynamic_only": code in dynamic_only,
+                    "is_permanent_hold": code in permanent_hold_codes,
+                    "permanent_dip_add": False,
                 })
 
                 if result["partial"]:
@@ -708,6 +732,33 @@ def run_backtest(
                             total_value += shares[c] * px
 
                 per_slot = total_value / n_active
+                buy_reasons = {c: "RANK_IN" for c in target_codes}
+
+                if params.permanent_dip_add_enabled and permanent_hold_codes and total_value > 0:
+                    for c in sorted(permanent_hold_codes):
+                        held = shares.get(c, 0)
+                        if held <= 0 or c in permanent_add_cooldown:
+                            continue
+                        signal_px = store.latest_price(c, signal_date)
+                        high_px = position_highs.get(c, signal_px)
+                        if np.isnan(signal_px) or signal_px <= 0 or np.isnan(high_px) or high_px <= 0:
+                            continue
+                        drawdown_from_high = signal_px / high_px - 1.0
+                        if drawdown_from_high > -params.permanent_dip_threshold:
+                            continue
+                        current_value = held * signal_px
+                        current_weight = current_value / total_value
+                        target_weight = min(
+                            params.permanent_max_weight,
+                            current_weight + params.permanent_dip_add_weight,
+                        )
+                        if target_weight <= current_weight:
+                            continue
+                        target_codes.add(c)
+                        target_weights[c] = max(target_weights.get(c, 0.0), target_weight)
+                        buy_reasons[c] = "PERMANENT_DIP_ADD"
+                        next_open_prices[c] = store.open_price(c, next_date)
+                        permanent_add_cooldown[c] = params.permanent_add_cooldown_days
 
                 for code in sorted(target_codes):
                     # Cooldown check
@@ -749,7 +800,7 @@ def run_backtest(
                     trade_records.append({
                         "date": signal_date, "trade_date": next_date,
                         "ts_code": code, "action": "BUY",
-                        "reason": "RANK_IN",
+                        "reason": buy_reasons.get(code, "RANK_IN"),
                         "price": result["price"], "shares": result["shares"],
                         "gross_cost": result["gross_cost"],
                         "cost": result["cost_total"],
@@ -758,6 +809,8 @@ def run_backtest(
                         "score": next((r["score"] for r in ranked if r["ts_code"] == code), np.nan),
                         "target_weight": target_weights.get(code, np.nan),
                         "is_dynamic_only": code in dynamic_only,
+                        "is_permanent_hold": code in permanent_hold_codes,
+                        "permanent_dip_add": buy_reasons.get(code) == "PERMANENT_DIP_ADD",
                         "dynamic_prior_return": next((r.get("dynamic_prior_return", np.nan) for r in ranked if r["ts_code"] == code), np.nan),
                         "dynamic_overheat_penalized": next((r.get("dynamic_overheat_penalized", False) for r in ranked if r["ts_code"] == code), False),
                     })
