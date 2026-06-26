@@ -115,6 +115,9 @@ class EngineParams:
     # ── Multi-factor scoring ──
     mf_vol_penalty: float = 0.0       # 0=disabled, 0.3=30% max penalty for high vol
     mf_rev_penalty: float = 0.0       # 0=disabled, penalize extreme 3d returns
+    mr_ma_period: int = 0              # 0=disabled, mean reversion MA period
+    mr_threshold: float = 1.3         # price/MA ratio threshold
+    mr_penalty: float = 0.5            # score multiplier when price/MA >= threshold
 
     # ── Backtest window ──
     initial_cash: float = 500_000.0
@@ -471,6 +474,23 @@ def run_backtest(
         if in_defense:
             target_codes = set()  # force empty → all positions sold, go to cash
         top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
+
+        # ── Mean reversion penalty ──
+        if params.mr_ma_period > 0 and len(ranked) > 1 and do_rebalance:
+            ma_period = params.mr_ma_period
+            threshold = params.mr_threshold
+            penalty = params.mr_penalty
+            for r in ranked:
+                code = r['ts_code']
+                prices = store.price_series(code, signal_date, ma_period + 5)
+                if len(prices) >= ma_period:
+                    ma_val = np.mean(prices[-ma_period:])
+                    if ma_val > 0:
+                        ratio = prices[-1] / ma_val
+                        if ratio >= threshold:
+                            r['score'] *= penalty
+            ranked.sort(key=lambda x: x['score'], reverse=True)
+            target_codes = set(r['ts_code'] for r in ranked[:params.holdings_num]) if do_rebalance else set()
 
         # ── 6d. Get next-day open prices ──
         next_open_prices: dict[str, float] = {}
