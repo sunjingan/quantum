@@ -47,6 +47,13 @@ class EngineParams:
     use_dynamic_pool: bool = False                         # add PIT liquidity pool on top of core/pit
     dynamic_top_n: int = 100
     dynamic_min_amount: float = 50_000_000
+    dynamic_fusion_mode: str = "union"                     # union or capped
+    dynamic_max_slots: int = 1                             # capped mode: max dynamic-only holdings
+    dynamic_max_total_weight: Optional[float] = 0.20       # capped mode: total dynamic-only weight cap
+    dynamic_score_margin: float = 0.05                     # dynamic score must beat weakest core by margin
+    dynamic_overheat_lookback: int = 20
+    dynamic_overheat_threshold: float = 0.10               # prior 20d return above this is penalized
+    dynamic_overheat_penalty: float = 0.50                 # score multiplier when overheated
 
     # ── Core strategy ──
     holdings_num: int = 5
@@ -321,6 +328,98 @@ def _build_dynamic_pool(store, date, top_n=100, min_amount=50_000_000):
     return set(code for code, _ in scores[:top_n])
 
 
+def _prior_return(store, code: str, date: pd.Timestamp, lookback: int) -> float:
+    prices = store.price_series(code, date, lookback)
+    if len(prices) < lookback + 1 or prices[0] <= 0:
+        return np.nan
+    return float(prices[-1] / prices[0] - 1.0)
+
+
+def _apply_dynamic_overheat_penalty(
+    ranked: list[dict],
+    dynamic_only: set[str],
+    store: ETFDailyStore,
+    date: pd.Timestamp,
+    params: EngineParams,
+) -> list[dict]:
+    if params.dynamic_fusion_mode != "capped" or not dynamic_only or params.dynamic_overheat_penalty >= 1.0:
+        return ranked
+    adjusted = []
+    for r in ranked:
+        item = dict(r)
+        code = item["ts_code"]
+        if code in dynamic_only:
+            prior = _prior_return(store, code, date, params.dynamic_overheat_lookback)
+            item["dynamic_prior_return"] = prior
+            if not np.isnan(prior) and prior >= params.dynamic_overheat_threshold:
+                item["score"] *= params.dynamic_overheat_penalty
+                item["dynamic_overheat_penalized"] = True
+            else:
+                item["dynamic_overheat_penalized"] = False
+        adjusted.append(item)
+    adjusted.sort(key=lambda x: x["score"], reverse=True)
+    return adjusted
+
+
+def _select_targets(
+    ranked: list[dict],
+    params: EngineParams,
+    core_set: set[str] | None,
+    dynamic_only: set[str] | None,
+) -> tuple[set[str], dict[str, float]]:
+    if params.dynamic_fusion_mode != "capped" or not core_set:
+        target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num])
+        if not target_codes:
+            return target_codes, {}
+        w = 1.0 / len(target_codes)
+        return target_codes, {c: w for c in target_codes}
+
+    dynamic_only = dynamic_only or set()
+    core_ranked = [r for r in ranked if r["ts_code"] in core_set]
+    dyn_ranked = [r for r in ranked if r["ts_code"] in dynamic_only]
+
+    selected = core_ranked[:params.holdings_num]
+    if len(selected) < params.holdings_num:
+        selected_codes = {r["ts_code"] for r in selected}
+        for r in dyn_ranked:
+            if r["ts_code"] in selected_codes:
+                continue
+            selected.append(r)
+            selected_codes.add(r["ts_code"])
+            if len(selected) >= params.holdings_num:
+                break
+    else:
+        dynamic_slots = max(0, params.dynamic_max_slots)
+        for dyn in dyn_ranked[:dynamic_slots]:
+            weakest = min(selected, key=lambda x: x["score"])
+            hurdle = weakest["score"] * (1.0 + params.dynamic_score_margin)
+            if dyn["score"] > hurdle:
+                selected.remove(weakest)
+                selected.append(dyn)
+
+    selected.sort(key=lambda x: x["score"], reverse=True)
+    selected = selected[:params.holdings_num]
+    target_codes = set(r["ts_code"] for r in selected)
+    if not target_codes:
+        return target_codes, {}
+
+    dyn_codes = target_codes & dynamic_only
+    core_codes = target_codes - dyn_codes
+    if not dyn_codes or params.dynamic_max_total_weight is None:
+        w = 1.0 / len(target_codes)
+        return target_codes, {c: w for c in target_codes}
+
+    dyn_total = min(params.dynamic_max_total_weight, len(dyn_codes) / len(target_codes))
+    if not core_codes:
+        w = 1.0 / len(dyn_codes)
+        return target_codes, {c: w for c in dyn_codes}
+
+    weights = {c: dyn_total / len(dyn_codes) for c in dyn_codes}
+    core_w = (1.0 - dyn_total) / len(core_codes)
+    weights.update({c: core_w for c in core_codes})
+    return target_codes, weights
+
+
 def run_backtest(
     params: EngineParams,
     token_path: Path = None,
@@ -442,15 +541,22 @@ def run_backtest(
                 in_defense = True
 
         # ── 6c. PIT pool switching + dual-pool fusion ──
+        core_set: set[str] | None = None
+        dynamic_only: set[str] = set()
         if pit_pools is not None:
-            active_pool = _get_active_pool(pit_pools, pool_months, signal_date)
+            pit_active = _get_active_pool(pit_pools, pool_months, signal_date)
+            active_pool = set(pit_active)
             if params.core_pool is not None:
-                active_pool |= (set(params.core_pool) & set(store.ts_codes))
+                core_set = set(params.core_pool) & set(store.ts_codes)
+                active_pool |= core_set
+                dynamic_only = active_pool - core_set
             temp_codes = store.ts_codes
             store.ts_codes = [c for c in temp_codes if c in active_pool]
             # Add dynamic pool if enabled
             if params.use_dynamic_pool:
                 dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
+                if core_set is not None:
+                    dynamic_only |= (dyn - core_set)
                 store.ts_codes = list(set(store.ts_codes) | dyn)
             ranked = get_ranked_etfs(store, signal_date, params)
             store.ts_codes = temp_codes
@@ -460,6 +566,7 @@ def run_backtest(
             if params.use_dynamic_pool:
                 dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
                 active_set = core_set | dyn
+                dynamic_only = dyn - core_set
             else:
                 active_set = core_set
             temp_codes = store.ts_codes
@@ -472,9 +579,14 @@ def run_backtest(
             active_pool = set(store.ts_codes)
 
         pool_size = len(active_pool)
-        target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num]) if do_rebalance else set()
+        ranked = _apply_dynamic_overheat_penalty(ranked, dynamic_only, store, signal_date, params)
+        if do_rebalance:
+            target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only)
+        else:
+            target_codes, target_weights = set(), {}
         if in_defense:
             target_codes = set()  # force empty → all positions sold, go to cash
+            target_weights = {}
         top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
 
         # ── Mean reversion penalty ──
@@ -492,7 +604,10 @@ def run_backtest(
                         if ratio >= threshold:
                             r['score'] *= penalty
             ranked.sort(key=lambda x: x['score'], reverse=True)
-            target_codes = set(r['ts_code'] for r in ranked[:params.holdings_num]) if do_rebalance else set()
+            if do_rebalance:
+                target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only)
+            else:
+                target_codes, target_weights = set(), {}
 
         # ── 6d. Get next-day open prices ──
         next_open_prices: dict[str, float] = {}
@@ -561,6 +676,8 @@ def run_backtest(
                     "cost": result["cost_total"],
                     "net_proceeds": result["net_proceeds"],
                     "partial": result["partial"],
+                    "target_weight": target_weights.get(code, 0.0),
+                    "is_dynamic_only": code in dynamic_only,
                 })
 
                 if result["partial"]:
@@ -602,7 +719,8 @@ def run_backtest(
                         continue
 
                     current_val = shares.get(code, 0) * exec_px
-                    diff = per_slot - current_val
+                    target_value = total_value * target_weights.get(code, 1.0 / n_active)
+                    diff = target_value - current_val
                     if diff <= 0:
                         continue
 
@@ -638,6 +756,10 @@ def run_backtest(
                         "net_cost": result["net_cost"],
                         "partial": result["partial"],
                         "score": next((r["score"] for r in ranked if r["ts_code"] == code), np.nan),
+                        "target_weight": target_weights.get(code, np.nan),
+                        "is_dynamic_only": code in dynamic_only,
+                        "dynamic_prior_return": next((r.get("dynamic_prior_return", np.nan) for r in ranked if r["ts_code"] == code), np.nan),
+                        "dynamic_overheat_penalized": next((r.get("dynamic_overheat_penalized", False) for r in ranked if r["ts_code"] == code), False),
                     })
 
                     if result["partial"]:
