@@ -110,7 +110,7 @@ def run_pit_backtest_variant(
         for m in reversed(pool_months):
             if m <= date:
                 return set(pit_pools[m])
-        return set(pit_pools[pool_months[0]])
+        return set()
     
     cash = params.initial_cash
     shares: dict[str, int] = {}
@@ -149,12 +149,8 @@ def run_pit_backtest_variant(
         
         # ── Next-day open prices ──
         next_open_prices = {}
-        df_open = store.open
         for code in (target_codes | set(shares.keys())):
-            if code in df_open.columns:
-                col = df_open[code].loc[:next_date].dropna()
-                if not col.empty:
-                    next_open_prices[code] = float(col.iloc[-1])
+            next_open_prices[code] = store.open_price(code, next_date)
         
         # ── Sell: exit positions not in target set ──
         for code in list(shares.keys()):
@@ -162,8 +158,6 @@ def run_pit_backtest_variant(
                 continue
             signal_px = store.latest_price(code, data_date)
             exec_px = next_open_prices.get(code, np.nan)
-            if np.isnan(exec_px) or exec_px <= 0:
-                exec_px = signal_px
             if np.isnan(exec_px) or exec_px <= 0:
                 continue
             
@@ -190,11 +184,6 @@ def run_pit_backtest_variant(
             should_sell = (code not in target_codes) or stop_triggered or atr_triggered
             
             if should_sell:
-                # Final fallback: use entry price if all else fails
-                if np.isnan(exec_px) or exec_px <= 0:
-                    exec_px = entry_prices.get(code, signal_px)
-                if np.isnan(exec_px) or exec_px <= 0:
-                    exec_px = 1.0  # absolute last resort
                 # Compute tiered slippage
                 avg_amt = get_avg_amount_20d(code, data_date)
                 if use_tiered_slippage:
@@ -251,8 +240,6 @@ def run_pit_backtest_variant(
                     
                     px = next_open_prices.get(code, np.nan)
                     if np.isnan(px) or px <= 0:
-                        px = store.latest_price(code, data_date)
-                    if np.isnan(px) or px <= 0:
                         continue
                     current_val = shares.get(code, 0) * px
                     diff = per_slot - current_val
@@ -280,10 +267,11 @@ def run_pit_backtest_variant(
                         continue
                     
                     total_cost += part_pen
-                    cash -= buy_shares * px * (1.0 + total_cost)
-                    
+
                     if trade_val < params.min_trade_value:
                         continue
+
+                    cash -= buy_shares * px * (1.0 + total_cost)
                     
                     old_shares = shares.get(code, 0)
                     shares[code] = old_shares + buy_shares

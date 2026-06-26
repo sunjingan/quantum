@@ -272,9 +272,15 @@ class ETFDailyStore:
         self.ts_codes = codes
         daily = daily[daily["ts_code"].isin(codes)].copy()
 
-        for col in ["open", "high", "low", "close", "vol", "amount"]:
+        # Tushare fund_daily.amount is reported in thousand yuan. Keep the
+        # public store.amount contract in yuan so liquidity thresholds and
+        # trade values use the same unit.
+        daily["amount_yuan"] = daily["amount"] * 1000.0
+
+        for col in ["open", "high", "low", "close", "vol", "amount_yuan"]:
             wide = daily.pivot_table(index="trade_date", columns="ts_code", values=col, aggfunc="last").sort_index()
-            setattr(self, col if col != "vol" else "volume", wide)
+            attr = "volume" if col == "vol" else "amount" if col == "amount_yuan" else col
+            setattr(self, attr, wide)
 
         self.calendar = (self.close if not self.close.empty else pd.DataFrame(index=daily["trade_date"].drop_duplicates())).index
 
@@ -286,6 +292,14 @@ class ETFDailyStore:
             return np.nan
         col = df[code].loc[:date].dropna()
         return float(col.iloc[-1]) if not col.empty else np.nan
+
+    def open_price(self, code: str, date: pd.Timestamp) -> float:
+        """Exact open price on `date`; execution must not use stale opens."""
+        df = self.open
+        if code not in df.columns or date not in df.index:
+            return np.nan
+        px = df.at[date, code]
+        return float(px) if pd.notna(px) and px > 0 else np.nan
 
     def price_series(self, ts_code: str, date: pd.Timestamp, lookback: int) -> np.ndarray:
         """Return close price array of length lookback+1 ending at `date`."""
@@ -542,16 +556,10 @@ def run_etf_loop_backtest(
         target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num])
 
 
-        # ── Buy: open new positions at next-day open ──
+        # ── Next-day execution prices ──
         next_open_prices = {}
-        for code in target_codes:
-            # Use store.open for next_date (or fallback to close)
-            df_open = store.open
-            if code in df_open.columns:
-                col = df_open[code].loc[:next_date].dropna()
-                next_open_prices[code] = float(col.iloc[-1]) if not col.empty else np.nan
-            else:
-                next_open_prices[code] = np.nan
+        for code in (target_codes | set(shares.keys())):
+            next_open_prices[code] = store.open_price(code, next_date)
         # ── Sell: exit positions not in target set ──
         sold_any = False
         for code in list(shares.keys()):
@@ -559,10 +567,6 @@ def run_etf_loop_backtest(
                 continue
             signal_px = store.latest_price(code, data_date)
             exec_px = next_open_prices.get(code, np.nan)  # sell at next open
-            if np.isnan(exec_px) or exec_px <= 0:
-                exec_px = signal_px  # fallback
-            if np.isnan(exec_px) or exec_px <= 0:
-                exec_px = entry_prices.get(code, signal_px)
             if np.isnan(exec_px) or exec_px <= 0:
                 continue
 

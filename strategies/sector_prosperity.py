@@ -20,6 +20,9 @@ import numpy as np
 import pandas as pd
 import tushare as ts
 
+
+_ETF_DAILY_PROCESS_CACHE: dict[Path, pd.DataFrame] = {}
+
 from strategies._fundamental import qlib_to_tushare, tushare_to_qlib
 
 
@@ -386,6 +389,10 @@ class SectorProsperityCache:
     def etf_daily(self) -> pd.DataFrame:
         if self._etf_daily_df is not None:
             return self._etf_daily_df
+        cache_key = self.sector_dir.resolve()
+        if cache_key in _ETF_DAILY_PROCESS_CACHE:
+            self._etf_daily_df = _ETF_DAILY_PROCESS_CACHE[cache_key]
+            return self._etf_daily_df
         self._etf_daily_df = pd.concat(
             [
                 self._load_glob(self.sector_dir, "fund_daily*.csv", {"ts_code": str}),
@@ -393,6 +400,7 @@ class SectorProsperityCache:
             ],
             ignore_index=True,
         )
+        _ETF_DAILY_PROCESS_CACHE[cache_key] = self._etf_daily_df
         return self._etf_daily_df
 
     def etf_share(self) -> pd.DataFrame:

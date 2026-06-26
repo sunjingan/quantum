@@ -191,29 +191,26 @@ def execute_sell(
     if shares_held <= 0:
         return None
     if np.isnan(exec_px) or exec_px <= 0:
-        exec_px = signal_px
-    if np.isnan(exec_px) or exec_px <= 0:
         return None  # no valid price
 
     trade_value = shares_held * exec_px
     cost = compute_dynamic_cost(avg_amount, trade_value, params)
     if cost["rejected"]:
-        # Even for sells, if partial fill is needed, handle it
-        if cost.get("partial"):
-            trade_value = cost["filled_value"]
-            shares_sold = int(trade_value / exec_px / 100) * 100
-            if shares_sold <= 0:
-                return None
-            proceeds = trade_value * (1.0 - cost["commission"] - cost["slip"] - cost["part_pen"])
-            return {
-                "code": code, "action": "SELL",
-                "shares": shares_sold, "partial": True,
-                "price": exec_px, "gross_proceeds": trade_value,
-                "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
-                "net_proceeds": proceeds,
-                "cost_detail": cost,
-            }
         return None
+    if cost.get("partial"):
+        shares_sold = int(cost["filled_value"] / exec_px / 100) * 100
+        if shares_sold <= 0:
+            return None
+        trade_value = shares_sold * exec_px
+        proceeds = trade_value * (1.0 - cost["commission"] - cost["slip"] - cost["part_pen"])
+        return {
+            "code": code, "action": "SELL",
+            "shares": shares_sold, "partial": True,
+            "price": exec_px, "gross_proceeds": trade_value,
+            "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
+            "net_proceeds": proceeds,
+            "cost_detail": cost,
+        }
 
     proceeds = trade_value * (1.0 - cost["commission"] - cost["slip"] - cost["part_pen"])
     return {
@@ -300,7 +297,7 @@ def _get_active_pool(pit_pools: dict, pool_months: list, date: pd.Timestamp) -> 
     for m in reversed(pool_months):
         if m <= date:
             return set(pit_pools[m])
-    return set(pit_pools[pool_months[0]])
+    return set()
 
 
 # ═══════════════════════════════════════
@@ -353,7 +350,10 @@ def run_backtest(
 
     if pit_pools is not None:
         pool_months = sorted(pit_pools.keys())
-        all_pool_ts = sorted(set(c for pool in pit_pools.values() for c in pool))
+        pit_union = set(c for pool in pit_pools.values() for c in pool)
+        if params.core_pool is not None:
+            pit_union |= set(params.core_pool)
+        all_pool_ts = sorted(pit_union)
     else:
         pool_months = None
         all_pool_ts = params.etf_pool_ts
@@ -444,6 +444,8 @@ def run_backtest(
         # ── 6c. PIT pool switching + dual-pool fusion ──
         if pit_pools is not None:
             active_pool = _get_active_pool(pit_pools, pool_months, signal_date)
+            if params.core_pool is not None:
+                active_pool |= (set(params.core_pool) & set(store.ts_codes))
             temp_codes = store.ts_codes
             store.ts_codes = [c for c in temp_codes if c in active_pool]
             # Add dynamic pool if enabled
@@ -495,10 +497,7 @@ def run_backtest(
         # ── 6d. Get next-day open prices ──
         next_open_prices: dict[str, float] = {}
         for code in (target_codes | set(shares.keys())):
-            if code in store.open.columns:
-                col = store.open[code].loc[:next_date].dropna()
-                if not col.empty:
-                    next_open_prices[code] = float(col.iloc[-1])
+            next_open_prices[code] = store.open_price(code, next_date)
 
         daily_commission = 0.0
         daily_slippage = 0.0

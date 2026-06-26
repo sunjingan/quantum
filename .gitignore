@@ -1,6 +1,7 @@
 .DS_Store
 __pycache__/
 .matplotlib/
+.matplotlib_cache/
 data/
 env_qlib/
 qlib/
