@@ -108,6 +108,14 @@ class EngineParams:
     # ── Rebalancing frequency ──
     rebalance_interval: int = 1
 
+    # ── Portfolio-level defense ──
+    defense_ma_period: int = 0        # NAV MA period for defense (0=disabled)
+    defense_exposure: float = 0.0     # exposure during defense (0=cash, 0.5=half)
+
+    # ── Multi-factor scoring ──
+    mf_vol_penalty: float = 0.0       # 0=disabled, 0.3=30% max penalty for high vol
+    mf_rev_penalty: float = 0.0       # 0=disabled, penalize extreme 3d returns
+
     # ── Backtest window ──
     initial_cash: float = 500_000.0
     benchmark: str = "sh000300"
@@ -418,6 +426,18 @@ def run_backtest(
         # ── 6b. Check if today is a rebalance day ──
         do_rebalance = (i % params.rebalance_interval == 0)
 
+        # ── 6b2. Portfolio-level defense ──
+        in_defense = False
+        if params.defense_ma_period > 0 and len(daily_records) >= params.defense_ma_period:
+            recent_nav = [r['portfolio_value'] for r in daily_records[-params.defense_ma_period:]]
+            nav_ma = sum(recent_nav) / len(recent_nav)
+            current_nav = cash + sum(
+                shares.get(c, 0) * (store.latest_price(c, signal_date) if not np.isnan(store.latest_price(c, signal_date)) and store.latest_price(c, signal_date) > 0 else entry_prices.get(c, 0))
+                for c in shares if shares.get(c, 0) > 0
+            )
+            if current_nav < nav_ma:
+                in_defense = True
+
         # ── 6c. PIT pool switching + dual-pool fusion ──
         if pit_pools is not None:
             active_pool = _get_active_pool(pit_pools, pool_months, signal_date)
@@ -448,6 +468,8 @@ def run_backtest(
 
         pool_size = len(active_pool)
         target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num]) if do_rebalance else set()
+        if in_defense:
+            target_codes = set()  # force empty → all positions sold, go to cash
         top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
 
         # ── 6d. Get next-day open prices ──
