@@ -49,8 +49,8 @@ def run_window(label: str, start: str, end: str) -> dict:
     params = make_config("F2_CAP_MA60", pit, f2, f2_orig, exp_tag, {}, start, end)
     params = EngineParams(**{**params.__dict__, **COST, "exp_tag": exp_tag})
 
-    eq_path = OUT / f"etf_loop_equity_{exp_tag}_h{start.replace('-','')}_{end.replace('-','')}.csv"
-    sm_path = OUT / f"etf_loop_summary_{exp_tag}_h{start.replace('-','')}_{end.replace('-','')}.csv"
+    eq_path = OUT / f"etf_loop_equity_{exp_tag}_h5_{start.replace('-','')}_{end.replace('-','')}.csv"
+    sm_path = OUT / f"etf_loop_summary_{exp_tag}_h5_{start.replace('-','')}_{end.replace('-','')}.csv"
 
     if eq_path.exists() and sm_path.exists():
         stats = pd.read_csv(sm_path).iloc[0].to_dict()

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Strict replication of friend's 9-ETF single-position strategy with friend_mode."""
+"""Daily-bar approximation of friend's 9-ETF single-position strategy.
+
+The original friend_mode needs intraday signal/fill data. It is intentionally
+not run here because using a future/open price for same-price execution is not
+a tradeable daily-bar backtest.
+"""
 from __future__ import annotations
 import sys
 from pathlib import Path
@@ -25,11 +30,11 @@ COMMON = {
 
 configs = [
     ("FR_1_Simple25d_FriendCost", "1. Simple 25d (friend cost)",
-     {**COMMON, "lookback_days": 25, "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}),
+     {**COMMON, "lookback_days": 25, "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}, True),
     
     ("FR_2_FriendMode_NoFilters", "2. friend_mode only, no filters",
      {**COMMON, "lookback_days": 25, "friend_mode": True,
-      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}),
+      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}, False),
     
     ("FR_3_FriendMode_Full", "3. friend_mode + all friend logic (strict rep)",
      {**COMMON, "lookback_days": 25, "friend_mode": True,
@@ -38,7 +43,7 @@ configs = [
       "use_drawdown_filter": True, "dd_use_enhanced": True,
       "min_score_threshold": 0.001, "max_score_threshold": 6.0,
       "use_premium_penalty": True, "premium_penalty": 1.0, "premium_threshold": 0.05,
-      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}),
+      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}, False),
     
     ("FR_4_NoFriendMode_Full", "4. NO friend_mode, all friend logic (compare)",
      {**COMMON, "lookback_days": 25, "friend_mode": False,
@@ -47,12 +52,15 @@ configs = [
       "use_drawdown_filter": True, "dd_use_enhanced": True,
       "min_score_threshold": 0.001, "max_score_threshold": 6.0,
       "use_premium_penalty": True, "premium_penalty": 0.5, "premium_threshold": 0.05,
-      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}),
+      "open_cost": 0.0002, "close_cost": 0.0002, "slippage": 0.001}, True),
 ]
 
 print(f"{'Config':<45s} {'Ann':>8s} {'Sharpe':>7s} {'DD':>8s} {'Final':>12s}")
 print("-" * 85)
-for tag, name, params_dict in configs:
+for tag, name, params_dict, is_safe in configs:
+    if not is_safe:
+        print(f"{name:<45s} {'SKIP':>8s} {'-':>7s} {'-':>8s} {'intraday data required':>12s}")
+        continue
     p = EngineParams(exp_tag=tag, **params_dict)
     sm = OUT / f"etf_loop_summary_{tag}_h5_20200101_20251231.csv"
     if sm.exists():

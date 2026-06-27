@@ -565,18 +565,28 @@ def main():
 
     lines.append("## 8. 成本压力测试 (2026 standalone)")
     lines.append("| 档位 | 佣金 | 滑点 | 单边 | 年化 | Sharpe | DD | 最终资产 |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|")
-    sm = OUT / "etf_loop_summary_VAL_YEAR_F2_CAP_MA60_2026_h5_20260101_20260625.csv"
-    if sm.exists():
-        s = pd.read_csv(sm).iloc[0].to_dict()
-        lines.append(f"| 原始(1+1bp) | 1bp | 1bp | 2bp | {fmt(s.get('annual_return', 0))} | {s.get('sharpe_ratio', 0):.2f} | {fmt(s.get('max_drawdown', 0))} | {s.get('final_value', 0):,.0f}Y |")
-    # Read cost tier summaries for the 2026 standalone runs
-    for tier_name, tier_label in [("optimistic", "乐观(0.5+1bp)"), ("baseline", "基准(1+2bp)"), ("conservative", "保守(2+5bp)")]:
-        # These are named COSTTIER_... but they share the same underlying data; read from COSTSTRESS
-        sm_tier = OUT / f"etf_loop_summary_COSTSTRESS_F2_CAP_MA60_full_2013_2026_h5_20130701_20260625.csv"
-        if sm_tier.exists() and tier_name == "baseline":
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    cost_rows = [
+        ("original", "原始(1+1bp)", "1bp", "1bp", "2bp"),
+        ("optimistic", "乐观(0.5+1bp)", "0.5bp", "1bp", "1.5bp"),
+        ("baseline", "基准(1+2bp)", "1bp", "2bp", "3bp"),
+        ("conservative", "保守(2+5bp)", "2bp", "5bp", "7bp"),
+    ]
+    missing_cost_rows = []
+    for tier_name, tier_label, commission, slip, one_side in cost_rows:
+        sm_tier = OUT / f"etf_loop_summary_COSTTIER_FIX1_F2_CAP_MA60_{tier_name}_2026_2026_h5_20260101_20260625.csv"
+        if sm_tier.exists():
             s = pd.read_csv(sm_tier).iloc[0].to_dict()
-            lines.append(f"| {tier_label} | 1bp | 2bp | 3bp | {fmt(s.get('annual_return', 0))} | {s.get('sharpe_ratio', 0):.2f} | {fmt(s.get('max_drawdown', 0))} | {s.get('final_value', 0):,.0f}Y |")
+            lines.append(
+                f"| {tier_label} | {commission} | {slip} | {one_side} | "
+                f"{fmt(s.get('annual_return', 0))} | {s.get('sharpe_ratio', 0):.2f} | "
+                f"{fmt(s.get('max_drawdown', 0))} | {s.get('final_value', 0):,.0f}Y |"
+            )
+        else:
+            missing_cost_rows.append(tier_label)
+    if missing_cost_rows:
+        lines.append("")
+        lines.append("> 缺失 2026 standalone 成本结果: " + ", ".join(missing_cost_rows) + "。运行 `python run_cost_stress_f2_cap_ma60_tiers.py` 后重新生成报告。")
     lines.append("")
 
     lines.append("## 9. 国内券商量化通道手续费参考")

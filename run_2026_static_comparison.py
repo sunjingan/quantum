@@ -74,11 +74,11 @@ def compute_pnl(trades):
 
 def run_config(name, tag, extra_params):
     """Run one config, return (equity_df, trades_df, stats_dict)."""
-    sm = OUT / f"etf_loop_summary_{tag}_h20260101_20260625.csv"
+    sm = OUT / f"etf_loop_summary_{tag}_h5_20260101_20260625.csv"
     if sm.exists():
         print(f"  {name}: skip existing")
-        eq = pd.read_csv(OUT / f"etf_loop_equity_{tag}_h20260101_20260625.csv", parse_dates=["date"])
-        trades = pd.read_csv(OUT / f"etf_loop_targets_{tag}_h20260101_20260625.csv", dtype={"ts_code": str})
+        eq = pd.read_csv(OUT / f"etf_loop_equity_{tag}_h5_20260101_20260625.csv", parse_dates=["date"])
+        trades = pd.read_csv(OUT / f"etf_loop_targets_{tag}_h5_20260101_20260625.csv", dtype={"ts_code": str})
         stats = pd.read_csv(sm).iloc[0].to_dict()
         return eq, trades, stats
 

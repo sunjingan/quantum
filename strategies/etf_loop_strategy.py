@@ -622,56 +622,6 @@ def score_etf(
             if current_price < ma_val:
                 return None  # below trend MA
 
-    # ── Wyckoff filter: avoid distribution zone buys ──
-    if getattr(params, 'use_wyckoff_filter', False):
-        wyck_range = getattr(params, 'wyckoff_range_days', 60)
-        wyck_dist_thresh = getattr(params, 'wyckoff_dist_threshold', 0.8)
-        wyck_vol_penalty = getattr(params, 'wyckoff_vol_penalty', 0.5)
-        if len(prices) >= wyck_range:
-            range_high = np.max(prices[-wyck_range:])
-            range_low = np.min(prices[-wyck_range:])
-            if range_high > range_low:
-                range_pct = (current_price - range_low) / (range_high - range_low)
-                # Check volume trend (declining volume = weak rally)
-                vol_recent = store.amount
-                vol_declining = False
-                if ts_code in vol_recent.columns:
-                    vol_col = vol_recent[ts_code].loc[:date].dropna()
-                    if len(vol_col) >= 10:
-                        vol_short = float(vol_col.iloc[-5:].mean())
-                        vol_long = float(vol_col.iloc[-10:].mean())
-                        vol_declining = vol_short < vol_long * 0.8
-                # Distribution zone: top of range + declining volume
-                if range_pct > wyck_dist_thresh and vol_declining:
-                    score *= wyck_vol_penalty
-
-    # ── Wyckoff V2: consolidation breakout (box detection) ──
-    if getattr(params, 'use_wyckoff_v2', False):
-        wyck_v2_range_thresh = getattr(params, 'wyckoff_v2_range_threshold', 0.20)
-        wyck_v2_vol_min = getattr(params, 'wyckoff_v2_vol_ratio', 1.3)
-        # Get volume data if available
-        vol_arr = None
-        try:
-            vol_col = store.amount.get(ts_code, None) if hasattr(store, 'amount') else None
-            if vol_col is not None:
-                vol_series = vol_col.loc[:date].dropna()
-                if len(vol_series) >= 120:
-                    vol_arr = vol_series.values
-        except:
-            pass
-        # MA60 filter (mandatory for Wyckoff V2)
-        if getattr(params, 'wyckoff_v2_require_ma60', True) and len(prices) >= 60:
-            ma60 = float(np.mean(prices[-60:]))
-            if current_price < ma60:
-                # Below MA60 = not in uptrend, hard skip
-                score = 0.0
-        # Consolidation breakout detection
-        is_bk, box_hi, box_lo, bk_score = _detect_wyckoff_breakout(
-            prices, vol_arr, 40, 120, wyck_v2_range_thresh, wyck_v2_vol_min)
-        if is_bk and bk_score > 0:
-            # Boost score for quality breakouts
-            score *= min(2.0, 1.0 + bk_score * 0.5)
-
     # ── Volume check ──
     if params.enable_volume_check:
         vol_ratio = store.volume_ratio(ts_code, date, params.volume_lookback)
@@ -724,6 +674,45 @@ def score_etf(
     r_squared = 1.0 - ss_res / ss_tot if ss_tot else 0.0
 
     score = annualized_returns * r_squared
+
+    # ── Wyckoff filter: avoid distribution zone buys ──
+    if getattr(params, 'use_wyckoff_filter', False):
+        wyck_range = getattr(params, 'wyckoff_range_days', 60)
+        wyck_dist_thresh = getattr(params, 'wyckoff_dist_threshold', 0.8)
+        wyck_vol_penalty = getattr(params, 'wyckoff_vol_penalty', 0.5)
+        if len(prices) >= wyck_range:
+            range_high = np.max(prices[-wyck_range:])
+            range_low = np.min(prices[-wyck_range:])
+            if range_high > range_low:
+                range_pct = (current_price - range_low) / (range_high - range_low)
+                vol_declining = False
+                if ts_code in store.amount.columns:
+                    vol_col = store.amount[ts_code].loc[:date].dropna()
+                    if len(vol_col) >= 10:
+                        vol_short = float(vol_col.iloc[-5:].mean())
+                        vol_long = float(vol_col.iloc[-10:].mean())
+                        vol_declining = vol_short < vol_long * 0.8
+                if range_pct > wyck_dist_thresh and vol_declining:
+                    score *= wyck_vol_penalty
+
+    # ── Wyckoff V2: consolidation breakout (box detection) ──
+    if getattr(params, 'use_wyckoff_v2', False):
+        wyck_v2_range_thresh = getattr(params, 'wyckoff_v2_range_threshold', 0.20)
+        wyck_v2_vol_min = getattr(params, 'wyckoff_v2_vol_ratio', 1.3)
+        vol_arr = None
+        if ts_code in store.amount.columns:
+            vol_series = store.amount[ts_code].loc[:date].dropna()
+            if len(vol_series) >= 120:
+                vol_arr = vol_series.values
+        if getattr(params, 'wyckoff_v2_require_ma60', True) and len(prices) >= 60:
+            ma60 = float(np.mean(prices[-60:]))
+            if current_price < ma60:
+                score = 0.0
+        is_bk, _box_hi, _box_lo, bk_score = _detect_wyckoff_breakout(
+            prices, vol_arr, 40, 120, wyck_v2_range_thresh, wyck_v2_vol_min
+        )
+        if is_bk and bk_score > 0:
+            score *= min(2.0, 1.0 + bk_score * 0.5)
 
     # ── Premium penalty ──
     if getattr(params, 'use_premium_penalty', False):

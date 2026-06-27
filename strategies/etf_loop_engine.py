@@ -203,7 +203,7 @@ class EngineParams:
     trading_start: str = ""  # if set, skip trading until this date (still record flat cash)
 
     # ── Friend strategy replication mode ──
-    friend_mode: bool = False  # enables: same-day open exec + yesterday's close signal + subtract penalty
+    friend_mode: bool = False  # disabled in this daily-bar engine; requires intraday signal/fill data
     # ── Position management ──
     use_score_weighting: bool = False  # weight by score instead of equal
     use_dynamic_holdings: bool = False  # vary N based on score dispersion
@@ -513,6 +513,41 @@ def _weight_targets(
     return weights
 
 
+def _enforce_dynamic_weight_cap(
+    weights: dict[str, float],
+    params: EngineParams,
+    dynamic_only: set[str] | None,
+) -> dict[str, float]:
+    """Re-apply dynamic-only weight cap after any custom sizing override."""
+    if not weights:
+        return {}
+    dynamic_only = dynamic_only or set()
+    cap = params.dynamic_max_total_weight
+    dyn_codes = [c for c in weights if c in dynamic_only]
+    core_codes = [c for c in weights if c not in dynamic_only]
+    if cap is None or not dyn_codes or not core_codes:
+        total = sum(max(0.0, float(v)) for v in weights.values())
+        return {c: max(0.0, float(v)) / total for c, v in weights.items()} if total > 0 else weights
+
+    dyn_total = sum(max(0.0, float(weights[c])) for c in dyn_codes)
+    core_total = sum(max(0.0, float(weights[c])) for c in core_codes)
+    total = dyn_total + core_total
+    if total <= 0:
+        return _weight_targets(set(weights), params, dynamic_only)
+    dyn_share = dyn_total / total
+    if dyn_share <= cap:
+        return {c: max(0.0, float(v)) / total for c, v in weights.items()}
+
+    capped_dyn_total = cap
+    capped_core_total = 1.0 - cap
+    out: dict[str, float] = {}
+    for c in dyn_codes:
+        out[c] = capped_dyn_total * max(0.0, float(weights[c])) / dyn_total if dyn_total > 0 else 0.0
+    for c in core_codes:
+        out[c] = capped_core_total * max(0.0, float(weights[c])) / core_total if core_total > 0 else 0.0
+    return out
+
+
 def _apply_switch_score_margin(
     target_codes: set[str],
     ranked: list[dict],
@@ -611,6 +646,12 @@ def run_backtest(
     Returns:
         equity_df, trade_df, audit_dict
     """
+    if params.friend_mode:
+        raise ValueError(
+            "friend_mode is disabled in the daily-bar engine: it needs intraday signal and fill data. "
+            "Using a future open in same-price execution is a look-ahead/untradeable assumption."
+        )
+
     if token_path is None:
         token_path = BASE_DIR / "config" / "tushare_token.txt"
     if cache_dir is None:
@@ -843,6 +884,7 @@ def run_backtest(
                     total_inv = sum(inv_vols.values())
                     if total_inv > 0:
                         target_weights = {c: v / total_inv for c, v in inv_vols.items()}
+                        target_weights = _enforce_dynamic_weight_cap(target_weights, params, dynamic_only)
             # ── Score-weighted position sizing (after switch score margin) ──
             if getattr(params, 'use_score_weighting', False) and target_codes and len(ranked) > 0:
                 _score_map = {}
@@ -860,6 +902,7 @@ def run_backtest(
                     total_raw = sum(raw.values())
                     if total_raw > 0:
                         target_weights = {c: v / total_raw for c, v in raw.items()}
+                        target_weights = _enforce_dynamic_weight_cap(target_weights, params, dynamic_only)
         else:
             target_codes, target_weights = set(), {}
         if in_defense:
