@@ -1,0 +1,72 @@
+# 2026 No-Warmup Analysis — F2_CAP_MA60
+**Data**: 2025-10-01 (context) → 2026-01-02 (first trade) → 2026-06-25
+**Config**: F2_v3 44-ETF + PIT capped + MA60, commission 1bp + slippage 1bp
+
+## 1. Key Metrics
+| Total Return | Annualized | Sharpe | Max DD | Final NAV | Trading Days | ETFs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 74.58% | 258.42% | 3.18 | -14.20% | 872,900 | 110 | 38 |
+
+## 2. Monthly Returns (all months active!)
+| Month | Return |
+|---:|---:|
+| 2026-01 | +18.99% |
+| 2026-02 | +5.95% |
+| 2026-03 | +11.56% |
+| 2026-04 | +9.00% |
+| 2026-05 | +16.13% |
+| 2026-06 | +0.08% |
+
+## 3. ETF PnL (FIFO)
+- ETFs traded: 38, Positive: 21/38, Total PnL: 323,152
+
+### Top 15
+| ETF | Code | PnL | Trades | Win Rate |
+|---|---:|---:|---:|
+| 国投瑞银白银期货(LOF)-A | 161226.SZ | 68,937 | 1 | 100% |
+| 嘉实原油(QDII-LOF-FOF) | 160723.SZ | 52,411 | 5 | 80% |
+| 华泰柏瑞中证韩交所中韩半导体ETF(QDII) | 513310.SH | 51,210 | 16 | 62% |
+| 南方原油(QDII-LOF-FOF)-A | 501018.SH | 44,584 | 6 | 83% |
+| 华夏国证半导体芯片ETF | 159995.SZ | 25,390 | 6 | 67% |
+| 景顺长城创业板50ETF | 159682.SZ | 17,741 | 8 | 75% |
+| 华夏上证科创板50成份ETF | 588000.SH | 15,564 | 7 | 57% |
+| 国泰中证半导体材料设备主题ETF | 159516.SZ | 13,836 | 8 | 38% |
+| 国泰中证全指通信设备ETF | 515880.SH | 13,806 | 7 | 57% |
+| 建信易盛郑商所能源化工期货ETF | 159981.SZ | 12,440 | 10 | 60% |
+| 嘉实上证科创板芯片ETF | 588200.SH | 11,719 | 3 | 67% |
+| 华安创业板50ETF | 159949.SZ | 9,718 | 4 | 100% |
+| 国联安中证全指半导体产品与设备ETF | 512480.SH | 8,251 | 7 | 43% |
+| 华夏野村日经225ETF(QDII) | 513520.SH | 6,911 | 7 | 43% |
+| 易方达创业板ETF | 159915.SZ | 5,266 | 7 | 57% |
+
+### Bottom 10
+| 鹏华中证酒ETF | 512690.SH | -771 | 1 |
+| 华夏国证自由现金流ETF | 159201.SZ | -1,047 | 5 |
+| 华夏黄金ETF | 518850.SH | -1,584 | 1 |
+| 汇添富国证港股通创新药ETF | 159570.SZ | -1,630 | 2 |
+| 国泰纳斯达克100ETF(QDII) | 513100.SH | -2,069 | 5 |
+| 南方中证申万有色金属ETF | 512400.SH | -3,085 | 3 |
+| 鹏华中证细分化工产业主题ETF | 159870.SZ | -4,370 | 4 |
+| 广发中证香港创新药ETF(QDII) | 513120.SH | -4,647 | 2 |
+| 华泰柏瑞中证红利低波动ETF | 512890.SH | -5,743 | 3 |
+| 富国中证800银行ETF | 159887.SZ | -16,012 | 5 |
+
+## 4. Crash Detection
+| Date | ETF | Pct Rank | Fwd 10d | Fwd DD |
+|---|---:|---:|---:|
+| 2026-01-28 | 永赢中证沪深港黄金产业股票ETF (517520.SH) | 98% | -16.2% | -19.8% |
+| 2026-02-25 | 华夏野村日经225ETF(QDII) (513520.SH) | 98% | -7.8% | -16.0% |
+| 2026-05-14 | 华泰柏瑞中证韩交所中韩半导体ETF(QDII) (513310.SH) | 98% | -2.7% | -15.8% |
+| 2026-04-17 | 汇添富国证港股通创新药ETF (159570.SZ) | 92% | -9.3% | -17.6% |
+| 2026-03-05 | 华夏黄金ETF (518850.SH) | 88% | -7.7% | -18.5% |
+| 2026-04-08 | 南方原油(QDII-LOF-FOF)-A (501018.SH) | 87% | -19.0% | -19.0% |
+| 2026-02-24 | 华夏野村日经225ETF(QDII) (513520.SH) | 95% | -6.8% | -14.5% |
+| 2026-03-31 | 嘉实原油(QDII-LOF-FOF) (160723.SZ) | 87% | -5.7% | -17.4% |
+
+## 5. Engine Change
+- Added `trading_start` parameter to `EngineParams`
+- No-warmup backtest: `start='2025-10-01'`, `trading_start='2026-01-02'`
+- Data loaded from Oct 2025 for MA60/momentum context, trading starts Jan 2026
+- Result: first trade Jan 6 (vs Mar 18 before), captures Jan +18.99%
+
+Charts: `/Users/jingansun/Desktop/codex/quant/outputs/etf_loop/F2_CAP_MA60_deep_dive/trade_charts_2026_nowarmup`

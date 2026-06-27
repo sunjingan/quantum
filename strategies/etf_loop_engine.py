@@ -4,7 +4,7 @@ K0: Unified ETF Loop Backtest Engine.
 
 Design invariants (non-negotiable):
   1. Single entry point. Same params + pool → identical results.
-  2. Daily loop: signal at date close → orders → execute at next_date open → value at next_date close.
+  2. Daily loop: signal at date close → orders → execute at configured future date/price → value at execution-date close.
   3. Pure execution functions. No stale variable reuse from outer loops.
   4. Transaction log must fully reconcile NAV:
        cash_t + Σ(shares_i,t × close_i,t) = portfolio_value_t
@@ -76,6 +76,62 @@ class EngineParams:
     min_score_threshold: float = 0.0
     max_score_threshold: float = 500.0
 
+
+    # ── Dynamic lookback ──
+    use_dynamic_lookback: bool = False
+    dyn_lookback_min: int = 10
+    dyn_lookback_max: int = 60
+    dyn_lookback_vol_ratio_cap: float = 0.9
+    dyn_lookback_short_window: int = 10
+    dyn_lookback_long_window: int = 60
+    dyn_lookback_use_atr: bool = True
+
+    # ── Enhanced drawdown ──
+    dd_use_enhanced: bool = True
+
+    # ── Premium penalty ──
+    use_premium_penalty: bool = False
+    premium_lookback: int = 20
+    premium_threshold: float = 0.05
+    premium_penalty: float = 0.5
+
+    # ── Drawdown filter ──
+    use_drawdown_filter: bool = False
+
+    # ── Reversal filter (anti-momentum-crash) ──
+    use_reversal_filter: bool = False
+    rev_lookback: int = 5
+    rev_sigma: float = 2.0
+    rev_penalty: float = 0.3
+    dd_lookback: int = 20
+    dd_max_drawdown_threshold: float = -0.15
+    dd_consecutive_decline_days: int = 5
+    # ── Wyckoff filter ──
+    use_wyckoff_filter: bool = False
+    use_wyckoff_prefilter: bool = False  # Layer 1 Wyckoff → Layer 2 momentum
+    # ── Wyckoff V2 (consolidation breakout) ──
+    use_wyckoff_v2: bool = False
+    wyckoff_v2_range_threshold: float = 0.20
+    wyckoff_v2_vol_ratio: float = 1.3
+    wyckoff_v2_require_ma60: bool = True
+
+    wyckoff_range_days: int = 60
+    wyckoff_dist_threshold: float = 0.8
+    wyckoff_vol_penalty: float = 0.6
+
+
+    # ── Volatility filter ──
+    use_vol_filter: bool = False
+    vol_filter_lookback: int = 20
+    vol_filter_threshold: float = 0.5
+
+    # ── Trend filter ──
+    use_trend_filter: bool = False
+    trend_ma_period: int = 50
+
+    # ── Volatility-adjusted position weighting ──
+    use_vol_weighting: bool = False
+    vol_weight_lookback: int = 20
     # ── ATR stop ──
     use_atr_stop_loss: bool = True
     atr_period: int = 14
@@ -111,9 +167,14 @@ class EngineParams:
     # ── Cooldown ──
     cooldown_days: int = 0
     cooldown_override_top_n: int = 3
+    switch_score_margin: float = 0.0  # keep current holding unless replacement score beats it by this margin
 
     # ── Rebalancing frequency ──
     rebalance_interval: int = 1
+
+    # ── Execution timing/price stress ──
+    execution_price_mode: str = "open"   # open, close, or vwap
+    execution_delay_days: int = 1        # 1 = next trading day
 
     # ── Portfolio-level defense ──
     defense_ma_period: int = 0        # NAV MA period for defense (0=disabled)
@@ -139,6 +200,16 @@ class EngineParams:
     initial_cash: float = 500_000.0
     benchmark: str = "sh000300"
     start: str = "2018-06-01"
+    trading_start: str = ""  # if set, skip trading until this date (still record flat cash)
+
+    # ── Friend strategy replication mode ──
+    friend_mode: bool = False  # enables: same-day open exec + yesterday's close signal + subtract penalty
+    # ── Position management ──
+    use_score_weighting: bool = False  # weight by score instead of equal
+    use_dynamic_holdings: bool = False  # vary N based on score dispersion
+    dyn_holdings_min: int = 3
+    dyn_holdings_max: int = 8
+
     end: str = "2026-06-25"
 
     # ── Output ──
@@ -375,27 +446,28 @@ def _select_targets(
     params: EngineParams,
     core_set: set[str] | None,
     dynamic_only: set[str] | None,
+    n_override: int = None,
 ) -> tuple[set[str], dict[str, float]]:
+    effective_n = n_override if n_override is not None else params.holdings_num
     if params.dynamic_fusion_mode != "capped" or not core_set:
-        target_codes = set(r["ts_code"] for r in ranked[:params.holdings_num])
+        target_codes = set(r["ts_code"] for r in ranked[:effective_n])
         if not target_codes:
             return target_codes, {}
-        w = 1.0 / len(target_codes)
-        return target_codes, {c: w for c in target_codes}
+        return target_codes, _weight_targets(target_codes, params, dynamic_only)
 
     dynamic_only = dynamic_only or set()
     core_ranked = [r for r in ranked if r["ts_code"] in core_set]
     dyn_ranked = [r for r in ranked if r["ts_code"] in dynamic_only]
 
-    selected = core_ranked[:params.holdings_num]
-    if len(selected) < params.holdings_num:
+    selected = core_ranked[:effective_n]
+    if len(selected) < effective_n:
         selected_codes = {r["ts_code"] for r in selected}
         for r in dyn_ranked:
             if r["ts_code"] in selected_codes:
                 continue
             selected.append(r)
             selected_codes.add(r["ts_code"])
-            if len(selected) >= params.holdings_num:
+            if len(selected) >= effective_n:
                 break
     else:
         dynamic_slots = max(0, params.dynamic_max_slots)
@@ -407,26 +479,125 @@ def _select_targets(
                 selected.append(dyn)
 
     selected.sort(key=lambda x: x["score"], reverse=True)
-    selected = selected[:params.holdings_num]
+    selected = selected[:effective_n]
     target_codes = set(r["ts_code"] for r in selected)
     if not target_codes:
         return target_codes, {}
 
+    return target_codes, _weight_targets(target_codes, params, dynamic_only)
+
+
+def _weight_targets(
+    target_codes: set[str],
+    params: EngineParams,
+    dynamic_only: set[str] | None,
+) -> dict[str, float]:
+    if not target_codes:
+        return {}
+
+    dynamic_only = dynamic_only or set()
     dyn_codes = target_codes & dynamic_only
     core_codes = target_codes - dyn_codes
     if not dyn_codes or params.dynamic_max_total_weight is None:
         w = 1.0 / len(target_codes)
-        return target_codes, {c: w for c in target_codes}
+        return {c: w for c in target_codes}
 
     dyn_total = min(params.dynamic_max_total_weight, len(dyn_codes) / len(target_codes))
     if not core_codes:
         w = 1.0 / len(dyn_codes)
-        return target_codes, {c: w for c in dyn_codes}
+        return {c: w for c in dyn_codes}
 
     weights = {c: dyn_total / len(dyn_codes) for c in dyn_codes}
     core_w = (1.0 - dyn_total) / len(core_codes)
     weights.update({c: core_w for c in core_codes})
-    return target_codes, weights
+    return weights
+
+
+def _apply_switch_score_margin(
+    target_codes: set[str],
+    ranked: list[dict],
+    shares: dict[str, int],
+    params: EngineParams,
+    dynamic_only: set[str] | None,
+) -> tuple[set[str], dict[str, float]]:
+    """Avoid churn when a new candidate only marginally beats an existing holding."""
+    if params.switch_score_margin <= 0 or not target_codes:
+        return target_codes, _weight_targets(target_codes, params, dynamic_only)
+
+    held_codes = {c for c, s in shares.items() if s > 0}
+    if not held_codes:
+        return target_codes, _weight_targets(target_codes, params, dynamic_only)
+
+    score_map = {
+        r["ts_code"]: float(r["score"])
+        for r in ranked
+        if "ts_code" in r and not pd.isna(r.get("score", np.nan))
+    }
+    keep_candidates = [
+        c for c in held_codes - target_codes
+        if c in score_map and score_map[c] > 0
+    ]
+    new_candidates = [
+        c for c in target_codes - held_codes
+        if c in score_map and score_map[c] > 0
+    ]
+    if not keep_candidates or not new_candidates:
+        return target_codes, _weight_targets(target_codes, params, dynamic_only)
+
+    keep_candidates.sort(key=lambda c: score_map[c], reverse=True)
+    new_candidates.sort(key=lambda c: score_map[c])
+
+    final_codes = set(target_codes)
+    for held_code in keep_candidates:
+        if not new_candidates:
+            break
+        weakest_new = new_candidates[0]
+        hurdle = score_map[held_code] * (1.0 + params.switch_score_margin)
+        if score_map[weakest_new] <= hurdle:
+            final_codes.remove(weakest_new)
+            final_codes.add(held_code)
+            new_candidates.pop(0)
+
+    return final_codes, _weight_targets(final_codes, params, dynamic_only)
+
+
+def _wyckoff_prefilter(store, date, params):
+    """Wyckoff Layer 1: keep only ETFs in accumulation/uptrend.
+    Returns filtered list of ts_codes."""
+    approved = []
+    for code in store.ts_codes:
+        prices = store.price_series(code, date, 120)
+        if len(prices) < 60:
+            continue
+        current_price = prices[-1]
+        # 1. Above MA60 (uptrend requirement)
+        ma60 = float(np.mean(prices[-60:]))
+        if current_price < ma60:
+            continue
+        # 2. Not in distribution (top 15% of 60d range + declining vol)
+        range_60_high = float(np.max(prices[-60:]))
+        range_60_low = float(np.min(prices[-60:]))
+        if range_60_low > 0 and range_60_high > range_60_low:
+            range_pct = (current_price - range_60_low) / (range_60_high - range_60_low)
+            if range_pct > 0.85:
+                try:
+                    vol_col = store.amount.get(code) if hasattr(store, 'amount') else None
+                    if vol_col is not None:
+                        vol_series = vol_col.loc[:date].dropna()
+                        if len(vol_series) >= 10:
+                            vol_short = float(vol_series.iloc[-5:].mean())
+                            vol_long = float(vol_series.iloc[-10:].mean())
+                            if vol_short < vol_long * 0.8:
+                                continue  # distribution zone
+                except:
+                    pass
+        # 3. Not in sustained decline (20d return > -5%)
+        if len(prices) >= 20:
+            ret_20d = prices[-1] / prices[-20] - 1.0
+            if ret_20d < -0.05:
+                continue
+        approved.append(code)
+    return approved if len(approved) >= 5 else store.ts_codes  # minimum 5 candidates
 
 
 def run_backtest(
@@ -516,11 +687,13 @@ def run_backtest(
     }
 
     # ── 6. Main loop ──
-    for i, signal_date in enumerate(calendar[:-1]):
+    execution_delay = max(1, int(params.execution_delay_days))
+    for i, signal_date in enumerate(calendar[:-execution_delay]):
+        exec_date = calendar[i + execution_delay]
         if i < params.lookback_days:
             # Warmup: record flat cash
             daily_records.append({
-                "date": calendar[i + 1],
+                "date": exec_date,
                 "portfolio_value": params.initial_cash,
                 "cash": params.initial_cash,
                 "position_count": 0, "target_count": 0, "pool_size": 0,
@@ -528,7 +701,18 @@ def run_backtest(
             })
             continue
 
-        next_date = calendar[i + 1]
+        # ── 5b. Trading start check ──
+        if params.trading_start:
+            ts = pd.Timestamp(params.trading_start)
+            if signal_date < ts:
+                daily_records.append({
+                    "date": exec_date,
+                    "portfolio_value": params.initial_cash,
+                    "cash": params.initial_cash,
+                    "position_count": 0, "target_count": 0, "pool_size": 0,
+                    "market_value": 0.0, "gross_pnl": 0.0, "cost_total": 0.0,
+                })
+                continue
 
         # ── 6a. Decrement cooldown ──
         for c in list(cooldown.keys()):
@@ -573,8 +757,15 @@ def run_backtest(
                 if core_set is not None:
                     dynamic_only |= (dyn - core_set)
                 store.ts_codes = list(set(store.ts_codes) | dyn)
-            ranked = get_ranked_etfs(store, signal_date, params)
-            store.ts_codes = temp_codes
+            # ── Wyckoff pre-filter: Layer 1 ──
+            if getattr(params, 'use_wyckoff_prefilter', False):
+                _original_codes = store.ts_codes
+                store.ts_codes = _wyckoff_prefilter(store, signal_date, params)
+            ranked = get_ranked_etfs(store, signal_date, params, exec_date if params.friend_mode else None)
+            if getattr(params, 'use_wyckoff_prefilter', False):
+                store.ts_codes = _original_codes
+            else:
+                store.ts_codes = temp_codes
         elif params.core_pool is not None:
             # Dual-pool mode: static core + dynamic
             core_set = set(params.core_pool) & set(store.ts_codes)
@@ -586,23 +777,26 @@ def run_backtest(
                 active_set = core_set
             temp_codes = store.ts_codes
             store.ts_codes = list(active_set)
-            ranked = get_ranked_etfs(store, signal_date, params)
-            store.ts_codes = temp_codes
+                    # ── Wyckoff pre-filter: Layer 1 ──
+            if getattr(params, 'use_wyckoff_prefilter', False):
+                _original_codes = store.ts_codes
+                store.ts_codes = _wyckoff_prefilter(store, signal_date, params)
+            ranked = get_ranked_etfs(store, signal_date, params, exec_date if params.friend_mode else None)
+            if getattr(params, 'use_wyckoff_prefilter', False):
+                store.ts_codes = _original_codes
+            else:
+                store.ts_codes = temp_codes
             active_pool = active_set
         else:
-            ranked = get_ranked_etfs(store, signal_date, params)
+                    # ── Wyckoff pre-filter: Layer 1 ──
+            if getattr(params, 'use_wyckoff_prefilter', False):
+                _original_codes = store.ts_codes
+                store.ts_codes = _wyckoff_prefilter(store, signal_date, params)
+            ranked = get_ranked_etfs(store, signal_date, params, exec_date if params.friend_mode else None)
             active_pool = set(store.ts_codes)
 
         pool_size = len(active_pool)
         ranked = _apply_dynamic_overheat_penalty(ranked, dynamic_only, store, signal_date, params)
-        if do_rebalance:
-            target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only)
-        else:
-            target_codes, target_weights = set(), {}
-        if in_defense:
-            target_codes = set()  # force empty → all positions sold, go to cash
-            target_weights = {}
-        top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
 
         # ── Mean reversion penalty ──
         if params.mr_ma_period > 0 and len(ranked) > 1 and do_rebalance:
@@ -619,15 +813,64 @@ def run_backtest(
                         if ratio >= threshold:
                             r['score'] *= penalty
             ranked.sort(key=lambda x: x['score'], reverse=True)
-            if do_rebalance:
-                target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only)
-            else:
-                target_codes, target_weights = set(), {}
+
+        if do_rebalance:
+            # ── Dynamic holdings count ──
+            effective_holdings = params.holdings_num
+            if getattr(params, 'use_dynamic_holdings', False) and len(ranked) >= 5:
+                top_scores = [float(r.get('score', 0)) for r in ranked[:params.dyn_holdings_max]]
+                top_scores = [s for s in top_scores if not np.isnan(s) and not np.isinf(s)]
+                if len(top_scores) >= 5:
+                    dispersion = (top_scores[0] - top_scores[4]) / max(abs(top_scores[0]), 0.0001)
+                    effective_holdings = max(params.dyn_holdings_min,
+                        min(params.dyn_holdings_max, int(params.dyn_holdings_max * (1.0 - min(dispersion, 1.0)))))
+            target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only, effective_holdings)
+            target_codes, target_weights = _apply_switch_score_margin(
+                target_codes, ranked, shares, params, dynamic_only
+            )
+            # ── Volatility-adjusted weighting override (after switch score margin) ──
+            if getattr(params, 'use_vol_weighting', False) and target_codes:
+                vol_lb = getattr(params, 'vol_weight_lookback', 20)
+                _vols = {}
+                for code in target_codes:
+                    prices_arr = store.price_series(code, signal_date, vol_lb + 5)
+                    if len(prices_arr) >= vol_lb + 1:
+                        rets = np.diff(prices_arr[-(vol_lb+1):]) / prices_arr[-(vol_lb+1):-1]
+                        vol = float(np.std(rets) * np.sqrt(252))
+                        _vols[code] = max(vol, 0.01)
+                if _vols:
+                    inv_vols = {c: 1.0 / v for c, v in _vols.items()}
+                    total_inv = sum(inv_vols.values())
+                    if total_inv > 0:
+                        target_weights = {c: v / total_inv for c, v in inv_vols.items()}
+            # ── Score-weighted position sizing (after switch score margin) ──
+            if getattr(params, 'use_score_weighting', False) and target_codes and len(ranked) > 0:
+                _score_map = {}
+                for r in ranked:
+                    code = r.get('ts_code', '')
+                    if code in target_codes:
+                        s = float(r.get('score', 0))
+                        if not np.isnan(s) and not np.isinf(s) and s > 0:
+                            _score_map[code] = s
+                if _score_map:
+                    if getattr(params, 'use_vol_weighting', False) and _vols:
+                        raw = {c: _score_map.get(c, 0.01) / _vols.get(c, 0.01) for c in target_codes}
+                    else:
+                        raw = {c: _score_map.get(c, 0.01) for c in target_codes}
+                    total_raw = sum(raw.values())
+                    if total_raw > 0:
+                        target_weights = {c: v / total_raw for c, v in raw.items()}
+        else:
+            target_codes, target_weights = set(), {}
+        if in_defense:
+            target_codes = set()  # force empty → all positions sold, go to cash
+            target_weights = {}
+        top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
 
         # ── 6d. Get next-day open prices ──
         next_open_prices: dict[str, float] = {}
         for code in (target_codes | set(shares.keys())):
-            next_open_prices[code] = store.open_price(code, next_date)
+            next_open_prices[code] = store.execution_price(code, exec_date, params.execution_price_mode)
 
         daily_commission = 0.0
         daily_slippage = 0.0
@@ -690,7 +933,7 @@ def run_backtest(
                 if code not in target_codes: reason.append("RANK_OUT")
 
                 trade_records.append({
-                    "date": signal_date, "trade_date": next_date,
+                    "date": signal_date, "trade_date": exec_date,
                     "ts_code": code, "action": "SELL",
                     "reason": "|".join(reason) if reason else "REBALANCE",
                     "price": result["price"], "shares": result["shares"],
@@ -757,7 +1000,7 @@ def run_backtest(
                         target_codes.add(c)
                         target_weights[c] = max(target_weights.get(c, 0.0), target_weight)
                         buy_reasons[c] = "PERMANENT_DIP_ADD"
-                        next_open_prices[c] = store.open_price(c, next_date)
+                        next_open_prices[c] = store.execution_price(c, exec_date, params.execution_price_mode)
                         permanent_add_cooldown[c] = params.permanent_add_cooldown_days
 
                 for code in sorted(target_codes):
@@ -798,7 +1041,7 @@ def run_backtest(
                                              + result["shares"] * exec_px) / (old_shares + result["shares"])
 
                     trade_records.append({
-                        "date": signal_date, "trade_date": next_date,
+                        "date": signal_date, "trade_date": exec_date,
                         "ts_code": code, "action": "BUY",
                         "reason": buy_reasons.get(code, "RANK_IN"),
                         "price": result["price"], "shares": result["shares"],
@@ -818,19 +1061,19 @@ def run_backtest(
                     if result["partial"]:
                         audit["partial_fills"] += 1
 
-        # ── 6g. Update position highs (on next_date close) ──
+        # ── 6g. Update position highs (on execution-date close) ──
         for c in shares:
             if shares.get(c, 0) <= 0:
                 continue
-            px_c = store.latest_price(c, next_date)
+            px_c = store.latest_price(c, exec_date)
             if not np.isnan(px_c) and px_c > 0:
                 position_highs[c] = max(position_highs.get(c, px_c), px_c)
 
-        # ── 6h. Value portfolio (next_date close) ──
+        # ── 6h. Value portfolio (execution-date close) ──
         market_value = 0.0
         for c in shares:
             if shares.get(c, 0) > 0:
-                px_c = store.latest_price(c, next_date)
+                px_c = store.latest_price(c, exec_date)
                 if not np.isnan(px_c) and px_c > 0:
                     market_value += shares[c] * px_c
                 else:
@@ -843,7 +1086,7 @@ def run_backtest(
             audit["nav_check_errors"] += 1
 
         daily_records.append({
-            "date": next_date,
+            "date": exec_date,
             "portfolio_value": portfolio_value,
             "cash": cash,
             "market_value": market_value,

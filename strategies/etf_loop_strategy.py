@@ -260,7 +260,8 @@ class ETFDailyStore:
     def __init__(self, cache: SectorProsperityCache, ts_codes: list[str], start: str, end: str):
         daily = cache.etf_daily()
         if daily.empty:
-            self.open = self.high = self.low = self.close = self.volume = self.amount = pd.DataFrame()
+            self.open = self.high = self.low = self.close = self.pct_chg = self.volume = self.amount = self.vwap = pd.DataFrame()
+            self.raw_close = self.signal_close = self.signal_open = self.signal_high = self.signal_low = self.signal_vwap = pd.DataFrame()
             self.calendar = pd.DatetimeIndex([])
             self.ts_codes: list[str] = []
             return
@@ -277,16 +278,52 @@ class ETFDailyStore:
         # trade values use the same unit.
         daily["amount_yuan"] = daily["amount"] * 1000.0
 
-        for col in ["open", "high", "low", "close", "vol", "amount_yuan"]:
+        for col in ["open", "high", "low", "close", "pct_chg", "vol", "amount_yuan"]:
             wide = daily.pivot_table(index="trade_date", columns="ts_code", values=col, aggfunc="last").sort_index()
             attr = "volume" if col == "vol" else "amount" if col == "amount_yuan" else col
             setattr(self, attr, wide)
 
+        self.raw_close = self.close.copy()
+
+        # VWAP is derived from Tushare amount (thousand yuan) and volume
+        # (hands). Invalid zero-volume rows are left as NaN and skipped by
+        # execution code instead of falling back to another price.
+        vol_shares = self.volume * 100.0
+        self.vwap = self.amount / vol_shares.replace(0, np.nan)
+        self.signal_close = self._build_adjusted_close()
+        self.signal_open = self._adjust_ohlc_like(self.open)
+        self.signal_high = self._adjust_ohlc_like(self.high)
+        self.signal_low = self._adjust_ohlc_like(self.low)
+        self.signal_vwap = self._adjust_ohlc_like(self.vwap)
+
         self.calendar = (self.close if not self.close.empty else pd.DataFrame(index=daily["trade_date"].drop_duplicates())).index
+
+    def _build_adjusted_close(self) -> pd.DataFrame:
+        """Continuous signal close built from pct_chg to avoid split/dividend jumps."""
+        if not hasattr(self, "pct_chg") or self.pct_chg.empty:
+            return self.close.copy()
+        ret = self.pct_chg / 100.0
+        adjusted = pd.DataFrame(index=self.close.index, columns=self.close.columns, dtype=float)
+        for code in self.close.columns:
+            valid = ret[code].dropna() if code in ret.columns else pd.Series(dtype=float)
+            if valid.empty:
+                adjusted[code] = self.close[code]
+                continue
+            first = valid.index[0]
+            adjusted.loc[first:, code] = (1.0 + ret.loc[first:, code].fillna(0.0)).cumprod()
+            first_close = self.close.at[first, code] if first in self.close.index and pd.notna(self.close.at[first, code]) else 1.0
+            adjusted.loc[first:, code] = adjusted.loc[first:, code] / adjusted.at[first, code] * float(first_close)
+        return adjusted
+
+    def _adjust_ohlc_like(self, raw_field: pd.DataFrame) -> pd.DataFrame:
+        if raw_field.empty or self.raw_close.empty or self.signal_close.empty:
+            return raw_field.copy()
+        ratio = raw_field / self.raw_close.replace(0, np.nan)
+        return self.signal_close * ratio
 
     def latest_price(self, code: str, date: pd.Timestamp) -> float:
         """Latest close price on or before `date` for `code`."""
-        df = self.close
+        df = self.signal_close
         ts = code if "." in code else f"{code[2:]}.{code[:2].upper()}"
         if code not in df.columns:
             return np.nan
@@ -294,8 +331,23 @@ class ETFDailyStore:
         return float(col.iloc[-1]) if not col.empty else np.nan
 
     def open_price(self, code: str, date: pd.Timestamp) -> float:
-        """Exact open price on `date`; execution must not use stale opens."""
-        df = self.open
+        """Exact adjusted open price on `date`; execution must not use stale opens."""
+        df = self.signal_open
+        if code not in df.columns or date not in df.index:
+            return np.nan
+        px = df.at[date, code]
+        return float(px) if pd.notna(px) and px > 0 else np.nan
+
+    def execution_price(self, code: str, date: pd.Timestamp, mode: str = "open") -> float:
+        """Exact adjusted execution price on `date` for a supported mode."""
+        if mode == "open":
+            return self.open_price(code, date)
+        if mode == "close":
+            df = self.signal_close
+        elif mode == "vwap":
+            df = self.signal_vwap
+        else:
+            raise ValueError(f"Unsupported execution_price_mode: {mode}")
         if code not in df.columns or date not in df.index:
             return np.nan
         px = df.at[date, code]
@@ -303,7 +355,7 @@ class ETFDailyStore:
 
     def price_series(self, ts_code: str, date: pd.Timestamp, lookback: int) -> np.ndarray:
         """Return close price array of length lookback+1 ending at `date`."""
-        df = self.close
+        df = self.signal_close
         if ts_code not in df.columns:
             return np.array([])
         col = df[ts_code].loc[:date].dropna()
@@ -314,8 +366,8 @@ class ETFDailyStore:
     def ohlc_series(self, ts_code: str, date: pd.Timestamp, lookback: int) -> dict[str, np.ndarray] | None:
         """Return dict of {close, high, low} arrays for ATR calculation."""
         result = {}
-        for field in ["close", "high", "low"]:
-            df = getattr(self, field)
+        for field, attr in [("close", "signal_close"), ("high", "signal_high"), ("low", "signal_low")]:
+            df = getattr(self, attr)
             if ts_code not in df.columns:
                 return None
             col = df[ts_code].loc[:date].dropna()
@@ -392,23 +444,233 @@ def calculate_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: 
     return float(atr_vals[-1])
 
 
+
+def _compute_volatility(prices: np.ndarray, window: int) -> float:
+    """Annualized volatility over `window` days."""
+    if len(prices) < window + 1:
+        return 0.0
+    rets = np.diff(prices[-window-1:]) / prices[-window-1:-1]
+    return float(np.std(rets) * np.sqrt(252))
+
+
+def _detect_wyckoff_breakout(prices: np.ndarray, volumes: np.ndarray = None,
+                              min_range_days: int = 40, max_range_days: int = 120,
+                              range_threshold: float = 0.20, vol_ratio_min: float = 1.3) -> tuple:
+    """Wyckoff V2: detect consolidation box breakout.
+    Returns (is_breakout, box_high, box_low, quality_score).
+    quality_score > 0 means a valid breakout was detected.
+    """
+    if len(prices) < max_range_days + 5:
+        return False, 0, 0, 0
+    
+    best_score = 0
+    best_high = 0
+    best_low = 0
+    is_breakout = False
+    
+    for window in [40, 60, 80, 100, 120]:
+        if len(prices) < window + 5:
+            continue
+        # Box = prices from [-(window+5):-5], breakout check in last 5 days
+        box_prices = prices[-(window+5):-5]
+        box_high = float(np.max(box_prices))
+        box_low = float(np.min(box_prices))
+        if box_low <= 0:
+            continue
+        range_pct = (box_high - box_low) / box_low
+        
+        if range_pct < range_threshold:  # Tight consolidation detected
+            recent = prices[-5:]
+            breakout_price = float(np.max(recent))
+            if breakout_price > box_high * 1.01:  # Breakout > 1% above box
+                vol_ok = True
+                vol_ratio = 1.0
+                if volumes is not None and len(volumes) >= window + 5:
+                    recent_vol = volumes[-5:]
+                    box_vol = volumes[-(window+5):-5]
+                    avg_box_vol = float(np.mean(box_vol)) if len(box_vol) > 0 else 0
+                    avg_recent_vol = float(np.mean(recent_vol)) if len(recent_vol) > 0 else 0
+                    if avg_box_vol > 0:
+                        vol_ratio = avg_recent_vol / avg_box_vol
+                    vol_ok = vol_ratio > vol_ratio_min
+                if vol_ok:
+                    score = (1.0 - range_pct / range_threshold) * vol_ratio
+                    if score > best_score:
+                        best_score = score
+                        best_high = box_high
+                        best_low = box_low
+                        is_breakout = True
+    
+    return is_breakout, best_high, best_low, best_score
+
 def score_etf(
     store: ETFDailyStore,
     ts_code: str,
     date: pd.Timestamp,
     params: ETFLoopParams,
+    exec_date: pd.Timestamp = None,
 ) -> dict | None:
     """Compute the full momentum score + filter-flags for one ETF.
 
     Returns None when the ETF fails any hard filter.
     """
-    lookback = max(params.lookback_days, params.short_lookback_days,
-                   params.rsi_period + params.rsi_lookback_days) + 20
-    prices = store.price_series(ts_code, date, lookback)
-    if len(prices) < params.lookback_days + 1:
+    # ── Friend mode: use yesterday's close + today's open ──
+    if getattr(params, 'friend_mode', False) and exec_date is not None:
+        max_lb = max(params.lookback_days, getattr(params, 'dyn_lookback_max', 60),
+                     params.short_lookback_days,
+                     params.rsi_period + params.rsi_lookback_days) + 20
+        prices_yesterday = store.price_series(ts_code, date, max_lb)
+        today_open = store.open_price(ts_code, exec_date) if exec_date is not None else np.nan
+        if prices_yesterday is not None and len(prices_yesterday) > 0 and not np.isnan(today_open) and today_open > 0:
+            prices = np.append(prices_yesterday, today_open)
+        else:
+            prices = np.array([])
+    else:
+        lookback = max(params.lookback_days, params.short_lookback_days,
+                       params.rsi_period + params.rsi_lookback_days) + 20
+        prices = store.price_series(ts_code, date, lookback)
+    effective_lookback = params.lookback_days
+    if len(prices) < effective_lookback + 1:
         return None
 
     current_price = prices[-1]
+
+    # ── Dynamic lookback (ATR-based, friend's method) ──
+    if getattr(params, 'use_dynamic_lookback', False):
+        use_atr_lb = getattr(params, 'dyn_lookback_use_atr', True)
+        if use_atr_lb:
+            lb_max = getattr(params, 'dyn_lookback_max', 60)
+            lb_min = getattr(params, 'dyn_lookback_min', 20)
+            ohlc = store.ohlc_series(ts_code, date, lb_max + 10)
+            if ohlc is not None and len(ohlc.get('high', [])) >= lb_max:
+                long_atr = calculate_atr(ohlc['high'], ohlc['low'], ohlc['close'], lb_max)
+                short_atr = calculate_atr(ohlc['high'], ohlc['low'], ohlc['close'], lb_min)
+                if long_atr > 0:
+                    atr_ratio = short_atr / long_atr
+                    cap = getattr(params, 'dyn_lookback_vol_ratio_cap', 0.9)
+                    effective_lookback = int(lb_min + (lb_max - lb_min) * (1.0 - min(cap, atr_ratio)))
+                    effective_lookback = max(lb_min, min(lb_max, effective_lookback))
+        else:
+            # Legacy: volatility-based
+            short_w = getattr(params, 'dyn_lookback_short_window', 10)
+            long_w = getattr(params, 'dyn_lookback_long_window', 60)
+            if len(prices) >= long_w + 1:
+                short_vol = _compute_volatility(prices, short_w)
+                long_vol = _compute_volatility(prices, long_w)
+                if long_vol > 0:
+                    vol_ratio = short_vol / long_vol
+                    cap = getattr(params, 'dyn_lookback_vol_ratio_cap', 0.9)
+                    lb_min = getattr(params, 'dyn_lookback_min', 10)
+                    lb_max = getattr(params, 'dyn_lookback_max', 60)
+                    effective_lookback = int(lb_min + (lb_max - lb_min) * (1.0 - min(cap, vol_ratio)))
+                    effective_lookback = max(lb_min, min(lb_max, effective_lookback))
+
+    # ── Enhanced drawdown filter (friend's con1/con2/con3) ──
+    if getattr(params, 'use_drawdown_filter', False):
+        use_enhanced_dd = getattr(params, 'dd_use_enhanced', True)
+        if use_enhanced_dd:
+            # con1: any of last 3 days dropped >5% in a single day
+            if len(prices) >= 4:
+                day1 = prices[-1] / prices[-2]
+                day2 = prices[-2] / prices[-3]
+                day3 = prices[-3] / prices[-4]
+                con1 = min(day1, day2, day3) < 0.95
+                # con2: 3 consecutive declines totaling >5% (from -4 to -1)
+                con2 = (prices[-1] < prices[-2]) & (prices[-2] < prices[-3]) & (prices[-3] < prices[-4]) & (prices[-1]/prices[-4] < 0.95)
+                # con3: same as con2 but shifted one day (from -5 to -2)
+                con3 = False
+                if len(prices) >= 6:
+                    con3 = (prices[-2] < prices[-3]) & (prices[-3] < prices[-4]) & (prices[-4] < prices[-5]) & (prices[-2]/prices[-5] < 0.95)
+                if con1 or con2 or con3:
+                    pass  # don't return None, just flag (score set to 0 later)
+            # Legacy simple DD filter
+            dd_lb = getattr(params, 'dd_lookback', 20)
+            if len(prices) >= dd_lb:
+                dd_window = prices[-dd_lb:]
+                peak_arr = np.maximum.accumulate(dd_window)
+                dd = float((dd_window[-1] / peak_arr[-1] - 1.0) if peak_arr[-1] > 0 else 0.0)
+                if dd < getattr(params, 'dd_max_drawdown_threshold', -0.15):
+                    return None
+        else:
+            dd_lb = getattr(params, 'dd_lookback', 20)
+            if len(prices) >= dd_lb:
+                dd_window = prices[-dd_lb:]
+                peak_arr = np.maximum.accumulate(dd_window)
+                dd = float((dd_window[-1] / peak_arr[-1] - 1.0) if peak_arr[-1] > 0 else 0.0)
+                if dd < getattr(params, 'dd_max_drawdown_threshold', -0.15):
+                    return None
+            cons_days = getattr(params, 'dd_consecutive_decline_days', 5)
+            if len(prices) >= cons_days + 1:
+                recent_days = prices[-(cons_days+1):]
+                if all(recent_days[i] < recent_days[i-1] for i in range(1, len(recent_days))):
+                    return None
+
+    # ── Volatility filter ──
+    if getattr(params, 'use_vol_filter', False):
+        vol_lb = getattr(params, 'vol_filter_lookback', 20)
+        if len(prices) >= vol_lb + 1:
+            vol_val = _compute_volatility(prices, vol_lb)
+            vol_thresh = getattr(params, 'vol_filter_threshold', 0.5)
+            if vol_val > vol_thresh:
+                return None  # too volatile
+
+    # ── Trend filter ──
+    if getattr(params, 'use_trend_filter', False):
+        ma_period = getattr(params, 'trend_ma_period', 50)
+        if len(prices) >= ma_period:
+            ma_val = np.mean(prices[-ma_period:])
+            if current_price < ma_val:
+                return None  # below trend MA
+
+    # ── Wyckoff filter: avoid distribution zone buys ──
+    if getattr(params, 'use_wyckoff_filter', False):
+        wyck_range = getattr(params, 'wyckoff_range_days', 60)
+        wyck_dist_thresh = getattr(params, 'wyckoff_dist_threshold', 0.8)
+        wyck_vol_penalty = getattr(params, 'wyckoff_vol_penalty', 0.5)
+        if len(prices) >= wyck_range:
+            range_high = np.max(prices[-wyck_range:])
+            range_low = np.min(prices[-wyck_range:])
+            if range_high > range_low:
+                range_pct = (current_price - range_low) / (range_high - range_low)
+                # Check volume trend (declining volume = weak rally)
+                vol_recent = store.amount
+                vol_declining = False
+                if ts_code in vol_recent.columns:
+                    vol_col = vol_recent[ts_code].loc[:date].dropna()
+                    if len(vol_col) >= 10:
+                        vol_short = float(vol_col.iloc[-5:].mean())
+                        vol_long = float(vol_col.iloc[-10:].mean())
+                        vol_declining = vol_short < vol_long * 0.8
+                # Distribution zone: top of range + declining volume
+                if range_pct > wyck_dist_thresh and vol_declining:
+                    score *= wyck_vol_penalty
+
+    # ── Wyckoff V2: consolidation breakout (box detection) ──
+    if getattr(params, 'use_wyckoff_v2', False):
+        wyck_v2_range_thresh = getattr(params, 'wyckoff_v2_range_threshold', 0.20)
+        wyck_v2_vol_min = getattr(params, 'wyckoff_v2_vol_ratio', 1.3)
+        # Get volume data if available
+        vol_arr = None
+        try:
+            vol_col = store.amount.get(ts_code, None) if hasattr(store, 'amount') else None
+            if vol_col is not None:
+                vol_series = vol_col.loc[:date].dropna()
+                if len(vol_series) >= 120:
+                    vol_arr = vol_series.values
+        except:
+            pass
+        # MA60 filter (mandatory for Wyckoff V2)
+        if getattr(params, 'wyckoff_v2_require_ma60', True) and len(prices) >= 60:
+            ma60 = float(np.mean(prices[-60:]))
+            if current_price < ma60:
+                # Below MA60 = not in uptrend, hard skip
+                score = 0.0
+        # Consolidation breakout detection
+        is_bk, box_hi, box_lo, bk_score = _detect_wyckoff_breakout(
+            prices, vol_arr, 40, 120, wyck_v2_range_thresh, wyck_v2_vol_min)
+        if is_bk and bk_score > 0:
+            # Boost score for quality breakouts
+            score *= min(2.0, 1.0 + bk_score * 0.5)
 
     # ── Volume check ──
     if params.enable_volume_check:
@@ -448,8 +710,8 @@ def score_etf(
     if params.use_short_momentum_filter and not np.isnan(short_annualized) and short_annualized < params.short_momentum_threshold:
         return None
 
-    # ── Long momentum (weighted regression) ──
-    recent = prices[-(params.lookback_days + 1):]
+    # ── Long momentum (weighted regression, dynamic lookback) ──
+    recent = prices[-(effective_lookback + 1):]
     y = np.log(recent)
     x = np.arange(len(y))
     weights = np.linspace(1, 2, len(y))
@@ -463,12 +725,59 @@ def score_etf(
 
     score = annualized_returns * r_squared
 
-    # ── 3-day single-day decline filter ──
+    # ── Premium penalty ──
+    if getattr(params, 'use_premium_penalty', False):
+        if getattr(params, 'friend_mode', False):
+            # Friend's subtract-1 mechanism (score range 0-6, subtract 1)
+            prem_lb = getattr(params, 'premium_lookback', 20)
+            if len(prices) >= prem_lb:
+                ma = np.mean(prices[-prem_lb:])
+                if ma > 0:
+                    premium_ratio = current_price / ma - 1.0
+                    prem_thresh = getattr(params, 'premium_threshold', 0.05)
+                    if premium_ratio > prem_thresh:
+                        score = max(0, score - getattr(params, 'premium_penalty', 0.5))
+        else:
+            # Our multiply mechanism
+            prem_lb = getattr(params, 'premium_lookback', 20)
+            if len(prices) >= prem_lb:
+                ma = np.mean(prices[-prem_lb:])
+                if ma > 0:
+                    premium_ratio = current_price / ma - 1.0
+                    prem_thresh = getattr(params, 'premium_threshold', 0.05)
+                    if premium_ratio > prem_thresh:
+                        score *= getattr(params, 'premium_penalty', 0.5)
+
+    # ── Short-term reversal filter (anti-momentum-crash) ──
+    if getattr(params, 'use_reversal_filter', False):
+        rev_window = getattr(params, 'rev_lookback', 5)
+        rev_sigma = getattr(params, 'rev_sigma', 2.0)
+        rev_penalty = getattr(params, 'rev_penalty', 0.3)
+        if len(prices) >= rev_window + 1:
+            rev_rets = np.diff(prices[-(rev_window+1):]) / prices[-(rev_window+1):-1]
+            rev_mean = np.mean(rev_rets)
+            rev_std = np.std(rev_rets)
+            if rev_std > 0:
+                recent_ret = prices[-1] / prices[-(rev_window+1)] - 1.0
+                if (recent_ret - rev_mean) > rev_sigma * rev_std:
+                    score *= rev_penalty
+
+    # ── Friend's enhanced decline filter (sets score to 0) ──
     if len(prices) >= 4:
         day1 = prices[-1] / prices[-2]
         day2 = prices[-2] / prices[-3]
         day3 = prices[-3] / prices[-4]
-        if min(day1, day2, day3) < params.loss:
+        con1 = min(day1, day2, day3) < params.loss
+        con2 = (prices[-1] < prices[-2]) & (prices[-2] < prices[-3]) & (prices[-3] < prices[-4]) & (prices[-1]/prices[-4] < params.loss)
+        con3 = False
+        if len(prices) >= 6:
+            con3 = (prices[-2] < prices[-3]) & (prices[-3] < prices[-4]) & (prices[-4] < prices[-5]) & (prices[-2]/prices[-5] < params.loss)
+        if con1 or con2 or con3:
+            score = 0.0
+    
+    # ── Score range filter (friend: 0 < score < 6) ──
+    if getattr(params, 'min_score_threshold', 0.0) > 0 or hasattr(params, 'max_score_threshold'):
+        if score < getattr(params, 'min_score_threshold', 0.0) or score > getattr(params, 'max_score_threshold', 500.0):
             score = 0.0
 
     return {
@@ -489,11 +798,12 @@ def get_ranked_etfs(
     store: ETFDailyStore,
     date: pd.Timestamp,
     params: ETFLoopParams,
+    exec_date: pd.Timestamp = None,
 ) -> list[dict]:
     """Return scored & ranked ETF list (filtered, sorted by score desc)."""
     results = []
     for ts_code in store.ts_codes:
-        metrics = score_etf(store, ts_code, date, params)
+        metrics = score_etf(store, ts_code, date, params, exec_date)
         if metrics is None:
             continue
         if params.min_score_threshold <= metrics["score"] <= params.max_score_threshold:
