@@ -989,10 +989,16 @@ def run_backtest(
                     # tiers_n must have len(tiers_ret)+1 (last = cash fallback)
                     while len(tiers_n) < len(tiers_ret) + 1:
                         tiers_n.append(0)
-                    effective_holdings = tiers_n[-1] if tiers_n else 0  # last = else/cash  # default: lowest tier
+                    effective_holdings = tiers_n[-1] if tiers_n else 0  # last = else/cash
+                    # Compute target exposure
+                    tiers_exp = [float(x) for x in getattr(params, 'adaptive_tiers_exposure', '1.00,1.00,1.00,1.00,1.00,0.00').split(',')]
+                    while len(tiers_exp) < len(tiers_ret) + 1:
+                        tiers_exp.append(0.0)
+                    target_exposure = tiers_exp[-1] if tiers_exp else 0.0  # default: lowest tier exposure
                     for i, t in enumerate(tiers_ret):
                         if ret_20d >= t:
                             effective_holdings = tiers_n[i]
+                            target_exposure = tiers_exp[i] if i < len(tiers_exp) else 1.0
                             break
                 
                 elif mode == 'bench_vol' and len(bench_hist) >= 21:
@@ -1162,6 +1168,53 @@ def run_backtest(
 
                 if params.cooldown_days > 0:
                     cooldown[code] = params.cooldown_days
+
+        # ── 6f. BUY: enter new positions ──
+        # ── 6e2. Exposure rebalancing: partial sell to match target_exposure ──
+        if target_exposure < 0.99 and do_rebalance:
+            total_mv = sum(shares.get(c, 0) * (store.latest_price(c, signal_date) if not np.isnan(store.latest_price(c, signal_date)) else 0)
+                          for c in shares if shares.get(c, 0) > 0)
+            total_equity = cash + total_mv
+            target_invested = total_equity * target_exposure
+            n_positions = max(1, sum(1 for c in target_codes if c in shares and shares.get(c, 0) > 0) or len(target_codes))
+            for code in list(shares.keys()):
+                if shares.get(code, 0) <= 0 or code not in target_codes:
+                    continue
+                px = store.latest_price(code, signal_date)
+                if np.isnan(px) or px <= 0:
+                    continue
+                current_val = shares[code] * px
+                target_val = target_invested / n_positions if n_positions > 0 else 0
+                if current_val > target_val * 1.05:  # 5% threshold
+                    excess_val = current_val - target_val
+                    exec_px = next_open_prices.get(code, np.nan)
+                    if np.isnan(exec_px) or exec_px <= 0:
+                        continue
+                    shares_to_sell = int(excess_val / exec_px / 100) * 100
+                    if shares_to_sell > 0 and shares_to_sell < shares[code]:
+                        liq = get_liquidity(code, signal_date)
+                        result = execute_sell(code, shares_to_sell, signal_px, exec_px,
+                                              entry_prices.get(code, 0), liq, params)
+                        if result:
+                            cash += result["net_proceeds"]
+                            shares[code] -= shares_to_sell
+                            daily_commission += result["cost_detail"]["commission"] * result["gross_proceeds"]
+                            daily_slippage += result["cost_detail"]["slip"] * result["gross_proceeds"]
+                            daily_part_pen += result["cost_detail"]["part_pen"] * result["gross_proceeds"]
+                            trade_records.append({
+                                "date": signal_date, "trade_date": exec_date,
+                                "ts_code": code, "action": "SELL",
+                                "reason": "EXPOSURE_REBALANCE",
+                                "price": result["price"], "shares": result["shares"],
+                                "gross_proceeds": result["gross_proceeds"],
+                                "cost": result["cost_total"],
+                                "net_proceeds": result["net_proceeds"],
+                                "partial": True,
+                                "target_weight": target_weights.get(code, 0.0),
+                                "is_dynamic_only": code in dynamic_only,
+                                "is_permanent_hold": code in permanent_hold_codes,
+                                "permanent_dip_add": False,
+                            })
 
         # ── 6f. BUY: enter new positions ──
         if do_rebalance:
