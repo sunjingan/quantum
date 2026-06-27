@@ -258,6 +258,7 @@ class ETFDailyStore:
     """Point-in-time ETF OHLCV + amount for a fixed code list."""
 
     def __init__(self, cache: SectorProsperityCache, ts_codes: list[str], start: str, end: str):
+        self.cache = cache
         daily = cache.etf_daily()
         if daily.empty:
             self.open = self.high = self.low = self.close = self.pct_chg = self.volume = self.amount = self.vwap = pd.DataFrame()

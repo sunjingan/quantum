@@ -47,6 +47,9 @@ class EngineParams:
     use_dynamic_pool: bool = False                         # add PIT liquidity pool on top of core/pit
     dynamic_top_n: int = 100
     dynamic_min_amount: float = 50_000_000
+    dynamic_min_list_days: int = 0
+    dynamic_use_trend_filter: bool = False
+    dynamic_trend_ma_period: int = 60
     dynamic_fusion_mode: str = "union"                     # union or capped
     dynamic_max_slots: int = 1                             # capped mode: max dynamic-only holdings
     dynamic_max_total_weight: Optional[float] = 0.20       # capped mode: total dynamic-only weight cap
@@ -207,6 +210,17 @@ class EngineParams:
     # ── Position management ──
     use_score_weighting: bool = False  # weight by score instead of equal
     use_dynamic_holdings: bool = False  # vary N based on score dispersion
+    use_market_adaptive_holdings: bool = False  # vary N based on benchmark strength
+    adaptive_mode: str = "bench_ma60"  # bench_ma60, bench_20d_ret, bench_vol, portfolio_dd
+    adaptive_window: int = 20  # lookback days for bench_20d_ret mode
+    adaptive_tiers_ret: str = "0.05,0.02,0.00,-0.03,-0.06"  # benchmark return tiers
+    adaptive_tiers_n: str = "5,4,3,2,1,0"  # position count for each tier
+    adaptive_tiers_exposure: str = "1.00,1.00,1.00,1.00,1.00,0.00"  # exposure fraction per tier
+    use_dynamic_score_threshold: bool = False  # relative threshold vs top score
+    dynamic_score_threshold_ratio: float = 0.6  # keep score >= ratio * top_score
+    use_rolling_score_threshold: bool = False  # rolling 252d P60 threshold
+    rolling_score_window: int = 252
+    adaptive_score_threshold: float = 0.0  # min score when positions reduced
     dyn_holdings_min: int = 3
     dyn_holdings_max: int = 8
 
@@ -391,18 +405,51 @@ def _get_active_pool(pit_pools: dict, pool_months: list, date: pd.Timestamp) -> 
 # Unified backtest
 # ═══════════════════════════════════════
 
-def _build_dynamic_pool(store, date, top_n=100, min_amount=50_000_000):
-    """PIT dynamic liquidity pool: top N ETFs by 5d avg amount > min_amount."""
+def _build_dynamic_pool(
+    store,
+    date,
+    top_n=100,
+    min_amount=50_000_000,
+    min_list_days: int = 0,
+    use_trend_filter: bool = False,
+    trend_ma_period: int = 60,
+):
+    """PIT dynamic liquidity pool with optional list-age and trend gates."""
     scores = []
     amt = store.amount
+    list_date_map: dict[str, pd.Timestamp] = {}
+    if min_list_days > 0:
+        try:
+            basic = store.cache.fund_basic_etf()
+            if not basic.empty and "ts_code" in basic.columns and "list_date" in basic.columns:
+                tmp = basic[["ts_code", "list_date"]].dropna(subset=["ts_code"]).copy()
+                tmp["ts_code"] = tmp["ts_code"].astype(str)
+                tmp["list_date"] = pd.to_datetime(
+                    tmp["list_date"].astype(str).str.replace(r"\.0$", "", regex=True),
+                    format="%Y%m%d",
+                    errors="coerce",
+                )
+                list_date_map = dict(zip(tmp["ts_code"], tmp["list_date"], strict=False))
+        except Exception:
+            list_date_map = {}
     for code in store.ts_codes:
         if code not in amt.columns:
             continue
+        if min_list_days > 0:
+            list_date = list_date_map.get(code)
+            if pd.isna(list_date):
+                continue
+            if (pd.Timestamp(date) - pd.Timestamp(list_date)).days < min_list_days:
+                continue
         col = amt[code].loc[:date].dropna()
         if len(col) < 5:
             continue
         avg = float(col.iloc[-5:].mean())
         if avg >= min_amount:
+            if use_trend_filter:
+                prices = store.price_series(code, date, trend_ma_period)
+                if len(prices) < trend_ma_period or prices[-1] <= np.mean(prices[-trend_ma_period:]):
+                    continue
             scores.append((code, avg))
     scores.sort(key=lambda x: x[1], reverse=True)
     return set(code for code, _ in scores[:top_n])
@@ -449,6 +496,9 @@ def _select_targets(
     n_override: int = None,
 ) -> tuple[set[str], dict[str, float]]:
     effective_n = n_override if n_override is not None else params.holdings_num
+    # Cash mode: no positions
+    if effective_n <= 0:
+        return set(), {}
     if params.dynamic_fusion_mode != "capped" or not core_set:
         target_codes = set(r["ts_code"] for r in ranked[:effective_n])
         if not target_codes:
@@ -635,6 +685,18 @@ def _wyckoff_prefilter(store, date, params):
     return approved if len(approved) >= 5 else store.ts_codes  # minimum 5 candidates
 
 
+
+def _load_csv_benchmark(benchmark_code: str, cache_dir: Path) -> pd.Series | None:
+    """Try loading benchmark close from CSV cache."""
+    csv_path = cache_dir / "benchmarks" / f"{benchmark_code}.csv"
+    if not csv_path.exists():
+        return None
+    df = pd.read_csv(csv_path, dtype={"trade_date": str})
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    s = df.set_index("trade_date")["close"].sort_index()
+    s.name = benchmark_code
+    return s
+
 def run_backtest(
     params: EngineParams,
     token_path: Path = None,
@@ -684,7 +746,15 @@ def run_backtest(
 
     # ── 3. Benchmark ──
     reader = QlibDailyReader(provider_uri)
-    bench_close = reader.read_field(params.benchmark, "close")
+    try:
+        bench_close = reader.read_field(params.benchmark, "close")
+    except:
+        bench_close = pd.Series(dtype=float)
+    # CSV fallback for benchmarks not in qlib
+    if len(bench_close) == 0:
+        csv_bench = _load_csv_benchmark(params.benchmark, cache_dir)
+        if csv_bench is not None:
+            bench_close = csv_bench
     bench_close = bench_close.loc[pd.Timestamp(params.start):pd.Timestamp(params.end)]
 
     calendar = store.calendar
@@ -729,6 +799,7 @@ def run_backtest(
 
     # ── 6. Main loop ──
     execution_delay = max(1, int(params.execution_delay_days))
+    score_history = []  # for rolling score threshold
     for i, signal_date in enumerate(calendar[:-execution_delay]):
         exec_date = calendar[i + execution_delay]
         if i < params.lookback_days:
@@ -794,7 +865,15 @@ def run_backtest(
             store.ts_codes = [c for c in temp_codes if c in active_pool]
             # Add dynamic pool if enabled
             if params.use_dynamic_pool:
-                dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
+                dyn = _build_dynamic_pool(
+                    store,
+                    signal_date,
+                    params.dynamic_top_n,
+                    params.dynamic_min_amount,
+                    params.dynamic_min_list_days,
+                    params.dynamic_use_trend_filter,
+                    params.dynamic_trend_ma_period,
+                )
                 if core_set is not None:
                     dynamic_only |= (dyn - core_set)
                 store.ts_codes = list(set(store.ts_codes) | dyn)
@@ -811,7 +890,15 @@ def run_backtest(
             # Dual-pool mode: static core + dynamic
             core_set = set(params.core_pool) & set(store.ts_codes)
             if params.use_dynamic_pool:
-                dyn = _build_dynamic_pool(store, signal_date, params.dynamic_top_n, params.dynamic_min_amount)
+                dyn = _build_dynamic_pool(
+                    store,
+                    signal_date,
+                    params.dynamic_top_n,
+                    params.dynamic_min_amount,
+                    params.dynamic_min_list_days,
+                    params.dynamic_use_trend_filter,
+                    params.dynamic_trend_ma_period,
+                )
                 active_set = core_set | dyn
                 dynamic_only = dyn - core_set
             else:
@@ -839,6 +926,24 @@ def run_backtest(
         pool_size = len(active_pool)
         ranked = _apply_dynamic_overheat_penalty(ranked, dynamic_only, store, signal_date, params)
 
+        # ── Rolling score threshold: track scores for 252d P60 ──
+        if getattr(params, 'use_rolling_score_threshold', False):
+            score_history.append([float(r.get('score', 0)) for r in ranked[:20] if not np.isnan(r.get('score', np.nan))])
+            win_len = getattr(params, 'rolling_score_window', 252)
+            if len(score_history) > win_len:
+                score_history = score_history[-win_len:]
+                all_scores = [s for day_scores in score_history for s in day_scores]
+                if all_scores:
+                    p60_thresh = float(np.quantile(all_scores, 0.60))
+                    ranked = [r for r in ranked if float(r.get('score', 0)) >= p60_thresh]
+            score_history.append([float(r.get('score', 0)) for r in ranked[:20] if not np.isnan(r.get('score', np.nan))])
+            win_len = getattr(params, 'rolling_score_window', 252)
+            if len(score_history) > win_len:
+                score_history = score_history[-win_len:]
+                all_scores = [s for day_scores in score_history for s in day_scores]
+                if all_scores:
+                    p60_thresh = float(np.quantile(all_scores, 0.60))
+                    ranked = [r for r in ranked if float(r.get('score', 0)) >= p60_thresh]
         # ── Mean reversion penalty ──
         if params.mr_ma_period > 0 and len(ranked) > 1 and do_rebalance:
             ma_period = params.mr_ma_period
@@ -856,8 +961,61 @@ def run_backtest(
             ranked.sort(key=lambda x: x['score'], reverse=True)
 
         if do_rebalance:
-            # ── Dynamic holdings count ──
+            # ── Adaptive holdings count (multi-mode) ──
             effective_holdings = params.holdings_num
+            target_exposure = 1.0  # default: full exposure
+            if getattr(params, 'use_market_adaptive_holdings', False):
+                mode = getattr(params, 'adaptive_mode', 'bench_ma60')
+                bench_hist = bench_close.loc[:signal_date]
+                
+                if mode == 'bench_ma60' and len(bench_hist) >= 60:
+                    bench_ma = float(bench_hist.iloc[-60:].mean())
+                    bench_now = float(bench_hist.iloc[-1])
+                    if bench_ma > 0:
+                        ratio = bench_now / bench_ma
+                        if ratio >= 1.03: effective_holdings = 5
+                        elif ratio >= 1.00: effective_holdings = 4
+                        elif ratio >= 0.97: effective_holdings = 3
+                        elif ratio >= 0.94: effective_holdings = 2
+                        elif ratio >= 0.90: effective_holdings = 1
+                        else: effective_holdings = 0
+                
+                elif mode == 'bench_20d_ret' and len(bench_hist) >= getattr(params, 'adaptive_window', 20) + 1:
+                    aw = getattr(params, 'adaptive_window', 20)
+                    ret_20d = float(bench_hist.iloc[-1] / bench_hist.iloc[-(aw+1)] - 1.0)
+                    # Read configurable tiers (or use defaults)
+                    tiers_ret = [float(x) for x in getattr(params, 'adaptive_tiers_ret', '0.05,0.02,0.00,-0.03,-0.06').split(',')]
+                    tiers_n = [int(x) for x in getattr(params, 'adaptive_tiers_n', '5,4,3,2,1,0').split(',')]
+                    # tiers_n must have len(tiers_ret)+1 (last = cash fallback)
+                    while len(tiers_n) < len(tiers_ret) + 1:
+                        tiers_n.append(0)
+                    effective_holdings = tiers_n[-1] if tiers_n else 0  # last = else/cash  # default: lowest tier
+                    for i, t in enumerate(tiers_ret):
+                        if ret_20d >= t:
+                            effective_holdings = tiers_n[i]
+                            break
+                
+                elif mode == 'bench_vol' and len(bench_hist) >= 21:
+                    bench_rets = bench_hist.pct_change().dropna().iloc[-20:]
+                    vol = float(bench_rets.std() * np.sqrt(252))
+                    if vol < 0.15: effective_holdings = 5
+                    elif vol < 0.20: effective_holdings = 4
+                    elif vol < 0.25: effective_holdings = 3
+                    elif vol < 0.30: effective_holdings = 2
+                    elif vol < 0.35: effective_holdings = 1
+                    else: effective_holdings = 0
+                
+                elif mode == 'portfolio_dd' and len(daily_records) >= 2:
+                    peak_nav = max(r['portfolio_value'] for r in daily_records)
+                    current_nav = daily_records[-1]['portfolio_value']
+                    dd = current_nav / peak_nav - 1.0 if peak_nav > 0 else 0
+                    if dd > -0.05: effective_holdings = 5
+                    elif dd > -0.10: effective_holdings = 4
+                    elif dd > -0.15: effective_holdings = 3
+                    elif dd > -0.20: effective_holdings = 2
+                    elif dd > -0.25: effective_holdings = 1
+                    else: effective_holdings = 0
+            # ── Dynamic holdings count (score dispersion) ──
             if getattr(params, 'use_dynamic_holdings', False) and len(ranked) >= 5:
                 top_scores = [float(r.get('score', 0)) for r in ranked[:params.dyn_holdings_max]]
                 top_scores = [s for s in top_scores if not np.isnan(s) and not np.isinf(s)]
@@ -1017,7 +1175,8 @@ def run_backtest(
                         if not np.isnan(px) and px > 0:
                             total_value += shares[c] * px
 
-                per_slot = total_value / n_active
+                investable = total_value * target_exposure
+                per_slot = investable / n_active
                 buy_reasons = {c: "RANK_IN" for c in target_codes}
 
                 if params.permanent_dip_add_enabled and permanent_hold_codes and total_value > 0:
