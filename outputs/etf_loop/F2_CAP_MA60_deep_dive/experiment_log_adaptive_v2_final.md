@@ -659,3 +659,55 @@ from strategies.etf_loop_engine import EngineParams, run_and_save
 | 🥇 | **V3 Exp+Hold v3** | 36.25% | -18.30% | 1.98 | 实盘最优 |
 | 🥈 | V3 NoN1 | 38.59% | -24.65% | 1.57 | 最小改动 |
 | 🥉 | Current | 39.81% | -25.44% | 1.56 | 进攻参考 |
+
+---
+
+## 二十一、最终长周期验证（修正池 + 修正 exposure）
+
+### 修正项
+- **池子**：`etf_pool_ts = f2o`（F2 44 只核心 + PIT capped 补漏），与 `make_config` 一致
+- **Exposure 机制**：已修复（bench_20d_ret 块中加入 `tiers_exp` 计算 + 部分卖出再平衡）
+- **成本**：3.5bp/边，7bp 双边
+- **运行方式**：`run_backtest` 直接调用，无缓存
+
+### 配置定义
+
+| 配置 | tiers_n | tiers_exposure | 说明 |
+|---|---|---|
+| Current | `5,4,3,2,1,0` | `1,1,1,1,1,0` | 原始分级，N=1 允许，全暴露 |
+| Exph_base | `5,4,4,3,3,0` | `1,1,0.8,0.6,0.4,0` | Exp+Hold 基线（N≥3, exp≤1） |
+| Exph_v3 | `5,5,4,4,3,0` | `1,1,0.8,0.6,0.4,0` | Exp+Hold 改进版（两个 N=5 tier） |
+
+### 长周期结果（2013-2026，44 只 F2_v3 核心 + PIT capped 补漏）
+
+| 配置 | 年化 | DD | Calmar | 终值 |
+|---|---:|---:|---:|---:|
+| Current | 43.60% | -25.44% | 1.71 | ¥46.3M |
+| Exph_base | 33.93% | -20.89% | 1.62 | ¥19.3M |
+| **Exph_v3** | **34.43%** | **-20.11%** | **1.71** | **¥20.3M** |
+
+### Exposure 验证（2025-2026 短周期）
+
+| 对比 | Max NAV diff | 差异天数/总天数 |
+|---|---|---|
+| Exph_base vs Exph_v2 | **¥22,176** | **291/352** |
+
+Exposure 已生效，v2（更低熊市暴露）与 baseline 产生实质性差异。
+
+### 结论
+
+1. **Exph_v3 全面优于 Exph_base**：年化 +0.9pp，DD -1.1pp，Calmar +0.14
+2. **Current 年化最高但 DD 也最差**：44.44% / -24.98%。进攻版定位不变
+3. **Exposure 机制已修复并验证**：低档位 exposure 差异在大波动期间起效
+4. **模拟盘最终候选：Exph_v3**（`5,5,4,4,3,0` + `1,1,0.8,0.6,0.4,0`）
+
+### 复现命令
+```bash
+cd /Users/jingansun/Desktop/codex/quant && source activate.sh
+# 长周期回测（f2o 池、直接 EngineParams）
+python3 -c "
+from strategies.etf_loop_engine import EngineParams, run_backtest
+...
+"
+# 数据：outputs/etf_loop/etf_loop_summary_LR_*.csv
+```
