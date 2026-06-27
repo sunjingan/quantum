@@ -238,6 +238,7 @@ def compute_dynamic_cost(
     avg_amount: float,
     trade_value: float,
     params: EngineParams,
+    side: str = "buy",
 ) -> dict:
     """
     Returns:
@@ -247,7 +248,7 @@ def compute_dynamic_cost(
         filled_value: actual value that can be traded (caps at part limit)
         rejected: True if filled_value < min_trade_value
     """
-    commission = params.open_cost  # same for buy and sell
+    commission = params.open_cost if side != "sell" else params.close_cost
 
     if params.use_dynamic_cost:
         slip = params.slippage  # default
@@ -295,7 +296,7 @@ def execute_sell(
         return None  # no valid price
 
     trade_value = shares_held * exec_px
-    cost = compute_dynamic_cost(avg_amount, trade_value, params)
+    cost = compute_dynamic_cost(avg_amount, trade_value, params, side="sell")
     if cost["rejected"]:
         return None
     if cost.get("partial"):
@@ -345,7 +346,7 @@ def execute_buy(
         return None
 
     trade_value = estimated_shares * exec_px
-    cost = compute_dynamic_cost(avg_amount, trade_value, params)
+    cost = compute_dynamic_cost(avg_amount, trade_value, params, side="buy")
     if cost["rejected"]:
         return None
 
@@ -932,18 +933,10 @@ def run_backtest(
             win_len = getattr(params, 'rolling_score_window', 252)
             if len(score_history) > win_len:
                 score_history = score_history[-win_len:]
-                all_scores = [s for day_scores in score_history for s in day_scores]
-                if all_scores:
-                    p60_thresh = float(np.quantile(all_scores, 0.60))
-                    ranked = [r for r in ranked if float(r.get('score', 0)) >= p60_thresh]
-            score_history.append([float(r.get('score', 0)) for r in ranked[:20] if not np.isnan(r.get('score', np.nan))])
-            win_len = getattr(params, 'rolling_score_window', 252)
-            if len(score_history) > win_len:
-                score_history = score_history[-win_len:]
-                all_scores = [s for day_scores in score_history for s in day_scores]
-                if all_scores:
-                    p60_thresh = float(np.quantile(all_scores, 0.60))
-                    ranked = [r for r in ranked if float(r.get('score', 0)) >= p60_thresh]
+            all_scores = [s for day_scores in score_history for s in day_scores]
+            if all_scores:
+                p60_thresh = float(np.quantile(all_scores, 0.60))
+                ranked = [r for r in ranked if float(r.get('score', 0)) >= p60_thresh]
         # ── Mean reversion penalty ──
         if params.mr_ma_period > 0 and len(ranked) > 1 and do_rebalance:
             ma_period = params.mr_ma_period
@@ -1029,6 +1022,25 @@ def run_backtest(
                     dispersion = (top_scores[0] - top_scores[4]) / max(abs(top_scores[0]), 0.0001)
                     effective_holdings = max(params.dyn_holdings_min,
                         min(params.dyn_holdings_max, int(params.dyn_holdings_max * (1.0 - min(dispersion, 1.0)))))
+
+            # ── Adaptive score threshold: only useful once holdings are reduced ──
+            if effective_holdings < params.holdings_num and ranked:
+                score_threshold = 0.0
+                if getattr(params, 'use_dynamic_score_threshold', False):
+                    top_score = float(ranked[0].get('score', 0.0))
+                    if top_score > 0:
+                        score_threshold = top_score * float(getattr(params, 'dynamic_score_threshold_ratio', 0.6))
+                elif float(getattr(params, 'adaptive_score_threshold', 0.0)) > 0:
+                    score_threshold = float(getattr(params, 'adaptive_score_threshold', 0.0))
+                if score_threshold > 0:
+                    filtered = [r for r in ranked if float(r.get('score', 0.0)) >= score_threshold]
+                    if filtered:
+                        ranked = filtered
+                        effective_holdings = min(effective_holdings, len(ranked))
+                    else:
+                        ranked = []
+                        effective_holdings = 0
+
             target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only, effective_holdings)
             target_codes, target_weights = _apply_switch_score_margin(
                 target_codes, ranked, shares, params, dynamic_only
@@ -1193,7 +1205,8 @@ def run_backtest(
                     shares_to_sell = int(excess_val / exec_px / 100) * 100
                     if shares_to_sell > 0 and shares_to_sell < shares[code]:
                         liq = get_liquidity(code, signal_date)
-                        result = execute_sell(code, shares_to_sell, signal_px, exec_px,
+                        signal_px_exposure = store.latest_price(code, signal_date)
+                        result = execute_sell(code, shares_to_sell, signal_px_exposure, exec_px,
                                               entry_prices.get(code, 0), liq, params)
                         if result:
                             cash += result["net_proceeds"]
