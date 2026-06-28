@@ -7,9 +7,9 @@
 - Moved Wyckoff score adjustments after the base momentum score is computed. Enabling Wyckoff filters no longer references `score` before assignment or gets overwritten by later score calculation.
 - Fixed cost-stress output path checks from `_h...` to `_h5...`, avoiding unnecessary reruns or stale file detection.
 - Versioned cost-tier reruns with `COSTTIER_FIX1_*` and regenerated all four cost tiers across 2013-2026, 2018-2026, and 2026 standalone.
-- Updated `analyze_2026_comprehensive.py` to read only 2026 standalone `COSTTIER_FIX1` results for its 2026 cost table.
-- Updated `run_2026_nowarmup.py` to print both full-record metrics and 2026 active-window metrics.
-- Updated `replicate_friend_baseline.py` to skip unsafe `friend_mode` cases instead of reading/generating contaminated outputs.
+- Updated `analysis/etf_loop/analyze_2026_comprehensive.py` to read only 2026 standalone `COSTTIER_FIX1` results for its 2026 cost table.
+- Updated `runs/etf_loop/run_2026_nowarmup.py` to print both full-record metrics and 2026 active-window metrics.
+- Updated `archive/etf_loop/replicate_friend_baseline.py` to skip unsafe `friend_mode` cases instead of reading/generating contaminated outputs.
 
 ## Outputs Regenerated
 
@@ -30,11 +30,11 @@
 
 ```bash
 source activate.sh
-python -m py_compile strategies/etf_loop_engine.py strategies/etf_loop_strategy.py run_2026_nowarmup.py analyze_2026_comprehensive.py replicate_friend_baseline.py run_cost_stress_f2_cap_ma60.py run_cost_stress_f2_cap_ma60_tiers.py run_2026_static_comparison.py
-python run_cost_stress_f2_cap_ma60_tiers.py
-python analyze_2026_comprehensive.py
-python run_2026_nowarmup.py
-python replicate_friend_baseline.py
+python -m py_compile strategies/etf_loop_engine.py strategies/etf_loop_strategy.py runs/etf_loop/run_2026_nowarmup.py analysis/etf_loop/analyze_2026_comprehensive.py archive/etf_loop/replicate_friend_baseline.py runs/etf_loop/run_cost_stress_f2_cap_ma60.py runs/etf_loop/run_cost_stress_f2_cap_ma60_tiers.py archive/etf_loop/run_2026_static_comparison.py
+python runs/etf_loop/run_cost_stress_f2_cap_ma60_tiers.py
+python analysis/etf_loop/analyze_2026_comprehensive.py
+python runs/etf_loop/run_2026_nowarmup.py
+python archive/etf_loop/replicate_friend_baseline.py
 ```
 
 ## Current Interpretation

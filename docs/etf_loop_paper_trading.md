@@ -18,13 +18,13 @@ source activate.sh
 ## 初始化账户
 
 ```bash
-python etf_loop_paper.py init --profile capped_f2 --cash 500000
+python runs/etf_loop/etf_loop_paper.py init --profile capped_f2 --cash 500000
 ```
 
 如果要重建账户：
 
 ```bash
-python etf_loop_paper.py init --profile capped_f2 --cash 500000 --force
+python runs/etf_loop/etf_loop_paper.py init --profile capped_f2 --cash 500000 --force
 ```
 
 `--force` 会覆盖 `account.json`，并清理该模拟盘目录下的旧 `orders.csv`、`trades.csv`、`nav.csv`、`signals/*.csv`、`reports/*.md`，避免新账户混入旧日志。
@@ -43,25 +43,25 @@ python etf_loop_paper.py init --profile capped_f2 --cash 500000 --force
 1. 收盘后更新 Tushare 数据：
 
 ```bash
-python etf_loop_paper.py update-data --start 2026-06-26 --end 2026-06-26
+python runs/etf_loop/etf_loop_paper.py update-data --start 2026-06-26 --end 2026-06-26
 ```
 
 2. 用信号日收盘后可见数据生成下一交易日计划订单：
 
 ```bash
-python etf_loop_paper.py generate --signal-date latest --trade-date next
+python runs/etf_loop/etf_loop_paper.py generate --signal-date latest --trade-date next
 ```
 
 如果要在生成信号时主动拉取信号日行情：
 
 ```bash
-python etf_loop_paper.py generate --signal-date 2026-06-26 --trade-date next --fetch-signal
+python runs/etf_loop/etf_loop_paper.py generate --signal-date 2026-06-26 --trade-date next --fetch-signal
 ```
 
 3. 下一交易日开盘后执行模拟成交：
 
 ```bash
-python etf_loop_paper.py execute --trade-date 2026-06-29 --fetch-trade
+python runs/etf_loop/etf_loop_paper.py execute --trade-date 2026-06-29 --fetch-trade
 ```
 
 `--fetch-trade` 会先通过 Tushare 拉取成交日行情。成交只用成交日开盘价；如果某 ETF 缺少成交日开盘价，订单会跳过，不会回退到信号日收盘价。
@@ -69,7 +69,7 @@ python etf_loop_paper.py execute --trade-date 2026-06-29 --fetch-trade
 4. 查看账户状态：
 
 ```bash
-python etf_loop_paper.py status --date latest
+python runs/etf_loop/etf_loop_paper.py status --date latest
 ```
 
 ## 一键日常命令
@@ -77,7 +77,7 @@ python etf_loop_paper.py status --date latest
 下面命令适合在收盘后执行，只负责更新数据并生成下一交易日订单，不会执行成交：
 
 ```bash
-python etf_loop_paper.py run-day --start 2026-06-26 --end 2026-06-26 --signal-date 2026-06-26 --trade-date next
+python runs/etf_loop/etf_loop_paper.py run-day --start 2026-06-26 --end 2026-06-26 --signal-date 2026-06-26 --trade-date next
 ```
 
 ## 输出文件
@@ -111,10 +111,10 @@ python etf_loop_paper.py run-day --start 2026-06-26 --end 2026-06-26 --signal-da
 不污染正式输出目录的测试命令：
 
 ```bash
-python etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test init --profile capped_f2 --cash 500000 --force
-python etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test generate --signal-date 2026-06-19 --trade-date 2026-06-22
-python etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test execute --trade-date 2026-06-22
-python etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test status --date 2026-06-22
+python runs/etf_loop/etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test init --profile capped_f2 --cash 500000 --force
+python runs/etf_loop/etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test generate --signal-date 2026-06-19 --trade-date 2026-06-22
+python runs/etf_loop/etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test execute --trade-date 2026-06-22
+python runs/etf_loop/etf_loop_paper.py --out-dir /private/tmp/etf_loop_paper_test status --date 2026-06-22
 ```
 
 该测试使用 `2026-06-19` 收盘信号，`2026-06-22` 开盘成交，验证信号日和成交日严格分离。

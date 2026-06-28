@@ -14,9 +14,9 @@
 
 ```bash
 source activate.sh
-python visualize_etf_trade_points.py --top-n 3
-python visualize_etf_trade_points.py --tags PERMHOLD_NASDAQ100_HOLDONLY --codes 513100.SH
-python visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 518880.SH
+python analysis/etf_loop/visualize_etf_trade_points.py --top-n 3
+python analysis/etf_loop/visualize_etf_trade_points.py --tags PERMHOLD_NASDAQ100_HOLDONLY --codes 513100.SH
+python analysis/etf_loop/visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 518880.SH
 ```
 
 输出目录：
@@ -39,7 +39,7 @@ python visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 51888
 
 ```bash
 source activate.sh
-python run_etf_loop_validation_suite.py
+python runs/etf_loop/run_etf_loop_validation_suite.py
 ```
 
 输出：
@@ -120,7 +120,7 @@ python run_etf_loop_validation_suite.py
 | 基准对比 | 部分完成 | 当前只有 HS300；还缺中证全指、创业板、中证1000、简单动量、宽基持有、纯货基。 |
 | 归因测试 | 未完成 | 需要 ETF/年份/交易/状态/风控贡献拆解。 |
 | 信号稳定性 | 未完成 | 需要排名分差、噪声扰动、换仓阈值测试。 |
-| 模拟盘/影子盘 | 已有工具，待运行 | `etf_loop_paper.py` 已实现；需要真实交易日持续记录。 |
+| 模拟盘/影子盘 | 已有工具，待运行 | `runs/etf_loop/etf_loop_paper.py` 已实现；需要真实交易日持续记录。 |
 | 小资金实盘 | 未开始 | 等模拟盘稳定后再做。 |
 | 实盘风控/熔断 | 未完成 | 需要固化 kill switch、最大仓位、最大换手、异常数据处理。 |
 

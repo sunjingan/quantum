@@ -1,8 +1,8 @@
 # ETF Loop capped 动态池融合实验报告
 
 目的：验证“动态池只作为补漏机制，而不是与静态精选池完全平权竞争 top 5”是否能改善旧双池融合。
-执行命令：`source activate.sh && python run_dynamic_fusion_experiments.py`。
-分析命令：`source activate.sh && python analyze_dynamic_fusion_experiment_results.py`。
+执行命令：`source activate.sh && python runs/etf_loop/run_dynamic_fusion_experiments.py`。
+分析命令：`source activate.sh && python analysis/etf_loop/analyze_dynamic_fusion_experiment_results.py`。
 
 ## 1. 新机制
 
@@ -45,6 +45,7 @@
 - 它高于静态 `F2_v3` 的年化 28.72%，也显著高于旧 union 的年化 26.40%。说明对较强但较窄的 44 只 F2_v3 池，动态池作为“有限补漏”是有效的。
 - 对 `F2_v3∪ORIG38`，最佳 capped 版本是 `DYNFUSE_F2v3_ORIG38_CAP1_W20_M10_H10P50`：年化 26.58%，Sharpe 1.29，最终资产 1065.1万。
 - 它显著优于旧 union 的年化 25.30%，但仍低于静态 64 池的年化 26.84%。说明静态 64 池已经足够强，动态池即使受限也仍有轻微机会成本。
+- 因此，这份报告没有推翻 `F2_CAP_MA60` 的 baseline 位置；它只说明动态池适合做“最多 1 个席位 / 10%~20% 权重”的补漏层，而不适合变成主池竞争者。
 - 20 日过热降权对 F2_v3 有正贡献：`H10P50` 系列收益和回撤均优于不降权版本，说明之前确实存在追高噪声。
 - 2 个动态席位即使总权重仍限制在 20%，效果也明显变差，说明“最多 1 个动态补漏席位”比“多动态候选低权重”更稳。
 - 下一步建议把候选默认改成：`dynamic_max_slots=1`、`dynamic_max_total_weight=0.10~0.20`、`dynamic_score_margin=0.05~0.10`、`prior20d>10% score x0.5`。如果主策略采用 F2_v3∪ORIG38，则默认仍建议静态 64，动态池只作为可选增强而非默认。

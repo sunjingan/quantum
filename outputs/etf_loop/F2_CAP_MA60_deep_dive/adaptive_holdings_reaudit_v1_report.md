@@ -10,7 +10,7 @@
 ## Repro Command
 
 ```bash
-source activate.sh && python run_adaptive_holdings_reaudit.py
+source activate.sh && python runs/etf_loop/run_adaptive_holdings_reaudit.py
 ```
 
 ## Source Notes

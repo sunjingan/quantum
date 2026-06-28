@@ -12,7 +12,7 @@
 ## Repro Command
 
 ```bash
-source activate.sh && python run_15d_behavior_v3_tuning.py
+source activate.sh && python runs/etf_loop/run_15d_behavior_v3_tuning.py
 ```
 
 ## Diagnostics Source

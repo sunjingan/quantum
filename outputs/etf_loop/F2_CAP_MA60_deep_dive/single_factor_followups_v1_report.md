@@ -11,7 +11,7 @@
 ## Repro Command
 
 ```bash
-source activate.sh && python run_single_factor_followups_v1.py
+source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py
 ```
 
 You can also run a single group with `--group widea_window`, `--group widea_threshold`, `--group exph_exposure`, `--group exph_n`, or `--group current_score`.
@@ -24,7 +24,7 @@ You can also run a single group with `--group widea_window`, `--group widea_thre
 ## WideA Window Perturbation
 
 - setting: Fix `adaptive_tiers_ret=0.06,0.03,0.00,-0.02,-0.05,-0.08` and `adaptive_tiers_n=5,5,4,3,2,1,0`; vary only `adaptive_window`.
-- repro: `source activate.sh && python run_single_factor_followups_v1.py --group widea_window`
+- repro: `source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py --group widea_window`
 - source report: `v3_multi_setting_diagnostics.md`
 
 | variant | tag | source | adaptive_window | adaptive_tiers_ret | adaptive_tiers_n | adaptive_tiers_exposure | use_score_weighting | switch_score_margin | annual_return | max_drawdown | sharpe_ratio | calmar | year_2018 | year_2022 | year_2024 | avg_actual_exp | avg_cash_ratio | trade_count |
@@ -42,7 +42,7 @@ You can also run a single group with `--group widea_window`, `--group widea_thre
 ## WideA Threshold Perturbation
 
 - setting: Fix `adaptive_window=15` and `adaptive_tiers_n=5,5,4,3,2,1,0`; vary only `adaptive_tiers_ret` by one notch.
-- repro: `source activate.sh && python run_single_factor_followups_v1.py --group widea_threshold`
+- repro: `source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py --group widea_threshold`
 - source report: `v3_multi_setting_diagnostics.md`
 
 | variant | tag | source | adaptive_window | adaptive_tiers_ret | adaptive_tiers_n | adaptive_tiers_exposure | use_score_weighting | switch_score_margin | annual_return | max_drawdown | sharpe_ratio | calmar | year_2018 | year_2022 | year_2024 | avg_actual_exp | avg_cash_ratio | trade_count |
@@ -59,7 +59,7 @@ You can also run a single group with `--group widea_window`, `--group widea_thre
 ## Exph_v3 Exposure Perturbation
 
 - setting: Fix `adaptive_window=15`, `adaptive_tiers_ret=0.05,0.02,0.00,-0.03,-0.06`, `adaptive_tiers_n=5,5,4,4,3,0`; vary only `adaptive_tiers_exposure`.
-- repro: `source activate.sh && python run_single_factor_followups_v1.py --group exph_exposure`
+- repro: `source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py --group exph_exposure`
 - source report: `v3_multi_setting_diagnostics.md`
 
 | variant | tag | source | adaptive_window | adaptive_tiers_ret | adaptive_tiers_n | adaptive_tiers_exposure | use_score_weighting | switch_score_margin | annual_return | max_drawdown | sharpe_ratio | calmar | year_2018 | year_2022 | year_2024 | avg_actual_exp | avg_cash_ratio | trade_count |
@@ -76,7 +76,7 @@ You can also run a single group with `--group widea_window`, `--group widea_thre
 ## Exph_v3 N Perturbation
 
 - setting: Already rerun under the current engine; fix `adaptive_window=15` and `adaptive_tiers_exposure=1,1,0.8,0.6,0.4,0`; vary only `adaptive_tiers_n`.
-- repro: `source activate.sh && python run_single_factor_followups_v1.py --group exph_n`
+- repro: `source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py --group exph_n`
 - source report: `adaptive_15d_v3_tuning_report.md`
 
 | variant | tag | source | adaptive_window | adaptive_tiers_ret | adaptive_tiers_n | adaptive_tiers_exposure | use_score_weighting | switch_score_margin | annual_return | max_drawdown | sharpe_ratio | calmar | year_2018 | year_2022 | year_2024 | avg_actual_exp | avg_cash_ratio | trade_count |
@@ -93,7 +93,7 @@ You can also run a single group with `--group widea_window`, `--group widea_thre
 ## Current Score Management
 
 - setting: Fix `adaptive_window=15`, `adaptive_tiers_ret=0.05,0.02,0.00,-0.03,-0.06`, `adaptive_tiers_n=5,4,3,2,1,0`; vary only `use_score_weighting` or `switch_score_margin`.
-- repro: `source activate.sh && python run_single_factor_followups_v1.py --group current_score`
+- repro: `source activate.sh && python runs/etf_loop/run_single_factor_followups_v1.py --group current_score`
 - source report: `v3_multi_setting_diagnostics.md`
 
 | variant | tag | source | adaptive_window | adaptive_tiers_ret | adaptive_tiers_n | adaptive_tiers_exposure | use_score_weighting | switch_score_margin | annual_return | max_drawdown | sharpe_ratio | calmar | year_2018 | year_2022 | year_2024 | avg_actual_exp | avg_cash_ratio | trade_count |

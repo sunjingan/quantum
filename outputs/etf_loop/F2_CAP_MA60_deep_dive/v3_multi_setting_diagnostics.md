@@ -11,7 +11,7 @@
 ## Repro Command
 
 ```bash
-source activate.sh && python run_v3_attribution_tables.py
+source activate.sh && python runs/etf_loop/run_v3_attribution_tables.py
 ```
 
 ## Acceptance Snapshot

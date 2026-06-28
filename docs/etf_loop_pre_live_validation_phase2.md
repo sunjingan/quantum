@@ -20,9 +20,9 @@ Walk-forward 按要求留到最后。
 
 ```bash
 source activate.sh
-python visualize_etf_trade_points.py --top-n 3
-python visualize_etf_trade_points.py --tags PERMHOLD_NASDAQ100_HOLDONLY --codes 513100.SH
-python visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 518880.SH
+python analysis/etf_loop/visualize_etf_trade_points.py --top-n 3
+python analysis/etf_loop/visualize_etf_trade_points.py --tags PERMHOLD_NASDAQ100_HOLDONLY --codes 513100.SH
+python analysis/etf_loop/visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 518880.SH
 ```
 
 修改：
@@ -41,7 +41,7 @@ python visualize_etf_trade_points.py --tags PERMHOLD_GOLD_HOLDONLY --codes 51888
 
 ```bash
 source activate.sh
-python run_execution_mode_experiments.py
+python runs/etf_loop/run_execution_mode_experiments.py
 ```
 
 输出：
@@ -72,7 +72,7 @@ python run_execution_mode_experiments.py
 
 ```bash
 source activate.sh
-python run_benchmark_comparison.py
+python runs/etf_loop/run_benchmark_comparison.py
 ```
 
 输出：
@@ -108,7 +108,7 @@ python run_benchmark_comparison.py
 
 ```bash
 source activate.sh
-python analyze_etf_loop_attribution.py
+python analysis/etf_loop/analyze_etf_loop_attribution.py
 ```
 
 输出：
@@ -135,7 +135,7 @@ python analyze_etf_loop_attribution.py
 
 ```bash
 source activate.sh
-python analyze_signal_stability.py
+python analysis/etf_loop/analyze_signal_stability.py
 ```
 
 输出：
@@ -166,14 +166,14 @@ python analyze_signal_stability.py
 
 ```bash
 source activate.sh
-python reconcile_paper_vs_backtest.py
+python analysis/etf_loop/reconcile_paper_vs_backtest.py
 ```
 
 输出：
 
 `outputs/etf_loop_paper/reconciliation_report.md`
 
-当前没有持续模拟盘真实日志，因此 reconciliation 报告主要列出必须记录的字段。等 `etf_loop_paper.py` 每日运行后，可把 paper orders/trades 与回测 target/trade CSV 按 `signal_date + trade_date + ts_code + action` 对齐。
+当前没有持续模拟盘真实日志，因此 reconciliation 报告主要列出必须记录的字段。等 `runs/etf_loop/etf_loop_paper.py` 每日运行后，可把 paper orders/trades 与回测 target/trade CSV 按 `signal_date + trade_date + ts_code + action` 对齐。
 
 ## 风控熔断
 

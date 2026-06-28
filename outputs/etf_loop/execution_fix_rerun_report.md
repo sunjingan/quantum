@@ -8,8 +8,8 @@
 - `strategies/etf_loop_engine.py`
 - `strategies/etf_loop_experiments.py`
 - `strategies/sector_prosperity.py`
-- `rerun_etf_loop_core.py`
-- `analyze_dynamic_pool_impact.py`
+- `runs/etf_loop/rerun_etf_loop_core.py`
+- `analysis/etf_loop/analyze_dynamic_pool_impact.py`
 
 ## 1. 本轮修复内容
 
@@ -46,9 +46,9 @@
 
 相关预缓存脚本：
 
-- `prefetch_enrichment.py`
-- `prefetch_theme_etf_data.py`
-- `prefetch_fundamental.py`
+- `tools/data_prep/prefetch_enrichment.py`
+- `tools/data_prep/prefetch_theme_etf_data.py`
+- `tools/data_prep/prefetch_fundamental.py`
 
 ## 3. 统一策略规则
 
@@ -127,20 +127,20 @@ find outputs/etf_loop -maxdepth 1 -type f -exec mv {} outputs/etf_loop/legacy_pr
 复跑核心实验集：
 
 ```bash
-python rerun_etf_loop_core.py
+python runs/etf_loop/rerun_etf_loop_core.py
 ```
 
 动态池影响归因：
 
 ```bash
-python analyze_dynamic_pool_impact.py
+python analysis/etf_loop/analyze_dynamic_pool_impact.py
 ```
 
 更细的动态池交易日志分段分析和可视化：
 
 ```bash
 source activate.sh
-python analyze_etf_loop_deep_dive.py
+python analysis/etf_loop/analyze_etf_loop_deep_dive.py
 ```
 
 本轮实际生成的核心输出：

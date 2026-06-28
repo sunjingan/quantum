@@ -12,8 +12,8 @@
 cd /Users/jingansun/Desktop/codex/quant
 source activate.sh
 
-python run_etf_loop_hyperparam_ablation.py
-python run_permanent_hold_experiments.py
+python runs/etf_loop/run_etf_loop_hyperparam_ablation.py
+python archive/etf_loop/run_permanent_hold_experiments.py
 ```
 
 输出文件：

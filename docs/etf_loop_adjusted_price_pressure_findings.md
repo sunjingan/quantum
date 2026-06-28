@@ -19,8 +19,8 @@ Run from repo root:
 
 ```bash
 source activate.sh
-python run_multi_setting_pressure_tests.py
-python run_adjusted_core_setting_comparison.py
+python runs/etf_loop/run_multi_setting_pressure_tests.py
+python runs/etf_loop/run_adjusted_core_setting_comparison.py
 ```
 
 Outputs:

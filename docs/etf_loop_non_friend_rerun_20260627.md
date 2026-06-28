@@ -15,11 +15,11 @@
 ## 执行命令
 
 ```bash
-source activate.sh && python run_position_mgmt_experiments.py
-source activate.sh && python run_long_period_optimization_compare.py
-source activate.sh && python run_wyckoff_prefilter_tests.py
-source activate.sh && python run_wyckoff_v2_tests.py
-python -m py_compile run_position_mgmt_experiments.py run_long_period_optimization_compare.py run_wyckoff_prefilter_tests.py run_wyckoff_v2_tests.py
+source activate.sh && python archive/etf_loop/run_position_mgmt_experiments.py
+source activate.sh && python archive/etf_loop/run_long_period_optimization_compare.py
+source activate.sh && python archive/etf_loop/run_wyckoff_prefilter_tests.py
+source activate.sh && python archive/etf_loop/run_wyckoff_v2_tests.py
+python -m py_compile archive/etf_loop/run_position_mgmt_experiments.py archive/etf_loop/run_long_period_optimization_compare.py archive/etf_loop/run_wyckoff_prefilter_tests.py archive/etf_loop/run_wyckoff_v2_tests.py
 ```
 
 ## 输出文件
