@@ -224,6 +224,23 @@ class EngineParams:
     dyn_holdings_min: int = 3
     dyn_holdings_max: int = 8
 
+    # ── Position risk throttle overlay ──
+    # Default-off. When enabled, high short-term price volatility or unstable
+    # turnover leaves cash instead of silently re-normalizing remaining weights.
+    use_position_risk_throttle: bool = False
+    risk_ret_std_short_window: int = 5
+    risk_ret_std_long_window: int = 20
+    risk_amount_cv_window: int = 20
+    risk_ret_std_threshold: float = 0.035
+    risk_amount_cv_threshold: float = 1.0
+    risk_exposure_multiplier: float = 0.5
+    risk_check_on_non_rebalance: bool = True
+
+    # ── Detailed trading logs ──
+    write_detailed_logs: bool = False
+    log_signal_top_n: int = 20
+    detailed_log_tail_days: int = 5
+
     end: str = "2026-06-25"
 
     # ── Output ──
@@ -461,6 +478,207 @@ def _prior_return(store, code: str, date: pd.Timestamp, lookback: int) -> float:
     if len(prices) < lookback + 1 or prices[0] <= 0:
         return np.nan
     return float(prices[-1] / prices[0] - 1.0)
+
+
+def _position_risk_metrics(
+    store: ETFDailyStore,
+    code: str,
+    date: pd.Timestamp,
+    params: EngineParams,
+) -> dict:
+    """Risk overlay inputs computed strictly from data available by signal date."""
+    short_w = max(1, int(params.risk_ret_std_short_window))
+    long_w = max(short_w, int(params.risk_ret_std_long_window))
+    amount_w = max(1, int(params.risk_amount_cv_window))
+
+    ret_std_short = np.nan
+    ret_std_long = np.nan
+    ret_std_score = np.nan
+    prices = store.price_series(code, date, long_w + 1)
+    if len(prices) >= short_w + 1:
+        short_prices = prices[-(short_w + 1):]
+        short_rets = np.diff(short_prices) / short_prices[:-1]
+        ret_std_short = float(np.std(short_rets, ddof=0))
+    if len(prices) >= long_w + 1:
+        long_prices = prices[-(long_w + 1):]
+        long_rets = np.diff(long_prices) / long_prices[:-1]
+        ret_std_long = float(np.std(long_rets, ddof=0))
+    if not np.isnan(ret_std_short) and not np.isnan(ret_std_long):
+        ret_std_score = (ret_std_short + ret_std_long) / 2.0
+
+    amount_cv = np.nan
+    if code in store.amount.columns:
+        amount = store.amount[code].loc[:date].dropna().tail(amount_w)
+        if len(amount) >= amount_w and float(amount.mean()) > 0:
+            amount_cv = float(amount.std(ddof=0) / amount.mean())
+
+    ret_flag = (
+        not np.isnan(ret_std_score)
+        and ret_std_score >= float(params.risk_ret_std_threshold)
+    )
+    amount_flag = (
+        not np.isnan(amount_cv)
+        and amount_cv >= float(params.risk_amount_cv_threshold)
+    )
+    return {
+        "risk_ret_std_short": ret_std_short,
+        "risk_ret_std_long": ret_std_long,
+        "risk_ret_std_score": ret_std_score,
+        "risk_amount_cv": amount_cv,
+        "risk_ret_flag": bool(ret_flag),
+        "risk_amount_flag": bool(amount_flag),
+        "risk_throttled": bool(ret_flag or amount_flag),
+    }
+
+
+def _build_etf_name_map(cache: SectorProsperityCache) -> dict[str, str]:
+    try:
+        basic = cache.fund_basic_etf()
+    except Exception:
+        return {}
+    if basic.empty or "ts_code" not in basic.columns:
+        return {}
+    name_col = "name" if "name" in basic.columns else "fund_name" if "fund_name" in basic.columns else None
+    if name_col is None:
+        return {}
+    tmp = basic[["ts_code", name_col]].dropna(subset=["ts_code"]).copy()
+    tmp["ts_code"] = tmp["ts_code"].astype(str)
+    tmp[name_col] = tmp[name_col].astype(str)
+    return dict(zip(tmp["ts_code"], tmp[name_col], strict=False))
+
+
+def _trade_reason_bucket(reason: str) -> str:
+    reason = str(reason)
+    if "RISK_THROTTLE" in reason:
+        return "RISK_HALF"
+    if "STOP_LOSS" in reason or "ATR_STOP" in reason:
+        return "STOP"
+    if "EXPOSURE_REBALANCE" in reason:
+        return "EXPOSURE_REBALANCE"
+    if "RANK_OUT" in reason or "RANK_IN" in reason or "REBALANCE" in reason:
+        return "REBALANCE"
+    if "PERMANENT_DIP_ADD" in reason:
+        return "DIP_ADD"
+    return "OTHER"
+
+
+def _fmt_log_pct(value: float) -> str:
+    return "" if pd.isna(value) else f"{value * 100:.2f}%"
+
+
+def _write_detailed_log_report(
+    path: Path,
+    params: EngineParams,
+    suffix: str,
+    account_log: pd.DataFrame,
+    position_log: pd.DataFrame,
+    signal_log: pd.DataFrame,
+    advice_log: pd.DataFrame,
+) -> None:
+    lines = [
+        "# ETF Loop Detailed Trading Log",
+        "",
+        f"- tag: `{params.exp_tag}`",
+        f"- suffix: `{suffix}`",
+        f"- signal rule: signal on T close, execute on future trading day by `{params.execution_price_mode}`",
+        "- note: CSV files contain the full daily logs; this Markdown shows the latest snapshot and recent actions.",
+        "",
+    ]
+
+    if not account_log.empty:
+        latest = account_log.sort_values("trade_date").iloc[-1]
+        lines += [
+            "## Latest Account",
+            "",
+            f"- signal_date: `{latest['signal_date']}`",
+            f"- trade_date: `{latest['trade_date']}`",
+            f"- nav: `{latest['portfolio_value']:.2f}`",
+            f"- cash_ratio: `{_fmt_log_pct(latest['cash_ratio'])}`",
+            f"- position_ratio: `{_fmt_log_pct(latest['position_ratio'])}`",
+            f"- position_count: `{int(latest['position_count'])}`",
+            f"- target_count: `{int(latest['target_count'])}`",
+            f"- target_exposure: `{_fmt_log_pct(latest['target_exposure'])}`",
+            f"- effective_holdings: `{int(latest['effective_holdings'])}`",
+            "",
+        ]
+
+    if not position_log.empty:
+        latest_trade_date = position_log["trade_date"].max()
+        pos = position_log[position_log["trade_date"].eq(latest_trade_date)].sort_values("weight", ascending=False)
+        lines += [
+            "## Latest Holdings",
+            "",
+            "| code | name | shares | close | market value | weight | entry | pnl from entry |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for r in pos.to_dict("records"):
+            lines.append(
+                f"| {r['ts_code']} | {r.get('name', '')} | {int(r['shares'])} | {r['close_price']:.4f} | "
+                f"{r['market_value']:.2f} | {_fmt_log_pct(r['weight'])} | {r['entry_price']:.4f} | "
+                f"{_fmt_log_pct(r['pnl_from_entry'])} |"
+            )
+        lines.append("")
+
+    if not advice_log.empty:
+        latest_signal = advice_log["signal_date"].max()
+        day = advice_log[advice_log["signal_date"].eq(latest_signal)].sort_values(["bucket", "action", "ts_code"])
+        lines += [
+            "## Latest Next-Day Operation Advice",
+            "",
+            "| action | bucket | code | name | reason | shares | target weight | exec date | exec price |",
+            "|---|---|---|---|---|---:|---:|---|---:|",
+        ]
+        for r in day.to_dict("records"):
+            lines.append(
+                f"| {r['action']} | {r['bucket']} | {r['ts_code']} | {r.get('name', '')} | {r.get('reason', '')} | "
+                f"{int(r.get('shares', 0))} | {_fmt_log_pct(r.get('target_weight', np.nan))} | "
+                f"{r.get('trade_date', '')} | {r.get('price', np.nan):.4f} |"
+            )
+        lines.append("")
+
+        recent_special = advice_log[advice_log["bucket"].isin(["RISK_HALF", "STOP"])].tail(20)
+        if not recent_special.empty:
+            lines += [
+                "## Recent Risk Half / Stop Records",
+                "",
+                "| signal | exec | bucket | action | code | name | reason | shares |",
+                "|---|---|---|---|---|---|---|---:|",
+            ]
+            for r in recent_special.to_dict("records"):
+                lines.append(
+                    f"| {r['signal_date']} | {r['trade_date']} | {r['bucket']} | {r['action']} | "
+                    f"{r['ts_code']} | {r.get('name', '')} | {r.get('reason', '')} | {int(r.get('shares', 0))} |"
+                )
+            lines.append("")
+
+    if not signal_log.empty:
+        latest_signal = signal_log["signal_date"].max()
+        sig = signal_log[signal_log["signal_date"].eq(latest_signal)].sort_values("rank").head(params.log_signal_top_n)
+        lines += [
+            "## Latest Momentum And Risk Snapshot",
+            "",
+            "| rank | code | name | score | target | held before | target weight | ret std score | amount CV | risk hit | dynamic only |",
+            "|---:|---|---|---:|---|---|---:|---:|---:|---|---|",
+        ]
+        for r in sig.to_dict("records"):
+            lines.append(
+                f"| {int(r['rank'])} | {r['ts_code']} | {r.get('name', '')} | {r.get('score', np.nan):.4f} | "
+                f"{bool(r.get('in_target', False))} | {bool(r.get('held_before_trade', False))} | "
+                f"{_fmt_log_pct(r.get('target_weight', np.nan))} | {r.get('risk_ret_std_score', np.nan):.4f} | "
+                f"{r.get('risk_amount_cv', np.nan):.4f} | {bool(r.get('risk_throttled', False))} | "
+                f"{bool(r.get('is_dynamic_only', False))} |"
+            )
+        lines.append("")
+
+    lines += [
+        "## Files",
+        "",
+        f"- account: `etf_loop_account_{suffix}.csv`",
+        f"- positions: `etf_loop_positions_{suffix}.csv`",
+        f"- signals: `etf_loop_signals_{suffix}.csv`",
+        f"- advice: `etf_loop_advice_{suffix}.csv`",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _apply_dynamic_overheat_penalty(
@@ -744,6 +962,8 @@ def run_backtest(
     # ── 2. Data store ──
     cache = SectorProsperityCache(token_path, cache_dir)
     store = ETFDailyStore(cache, all_pool_ts, params.start, params.end)
+    detailed_logs_enabled = bool(getattr(params, "write_detailed_logs", False))
+    etf_name_map = _build_etf_name_map(cache) if detailed_logs_enabled else {}
 
     # ── 3. Benchmark ──
     reader = QlibDailyReader(provider_uri)
@@ -786,9 +1006,14 @@ def run_backtest(
     cooldown: dict[str, int] = {}
     permanent_hold_codes = set(params.permanent_hold_codes or ())
     permanent_add_cooldown: dict[str, int] = {}
+    risk_throttled_codes: set[str] = set()
 
     daily_records: list[dict] = []
     trade_records: list[dict] = []
+    account_records: list[dict] = []
+    position_records: list[dict] = []
+    signal_snapshot_records: list[dict] = []
+    operation_advice_records: list[dict] = []
     audit: dict = {
         "total_commission": 0.0,
         "total_slippage": 0.0,
@@ -953,10 +1178,10 @@ def run_backtest(
                             r['score'] *= penalty
             ranked.sort(key=lambda x: x['score'], reverse=True)
 
+        effective_holdings = params.holdings_num
+        target_exposure = 1.0  # default: full exposure
         if do_rebalance:
             # ── Adaptive holdings count (multi-mode) ──
-            effective_holdings = params.holdings_num
-            target_exposure = 1.0  # default: full exposure
             if getattr(params, 'use_market_adaptive_holdings', False):
                 mode = getattr(params, 'adaptive_mode', 'bench_ma60')
                 bench_hist = bench_close.loc[:signal_date]
@@ -1084,7 +1309,55 @@ def run_backtest(
         if in_defense:
             target_codes = set()  # force empty → all positions sold, go to cash
             target_weights = {}
+
+        risk_metrics_by_code: dict[str, dict] = {}
+        if getattr(params, 'use_position_risk_throttle', False):
+            risk_universe = target_codes | set(shares.keys())
+            for code in risk_universe:
+                risk_metrics_by_code[code] = _position_risk_metrics(store, code, signal_date, params)
+            if do_rebalance and target_weights:
+                throttle_mult = max(0.0, min(1.0, float(params.risk_exposure_multiplier)))
+                for code in list(target_weights.keys()):
+                    metrics = risk_metrics_by_code.get(code, {})
+                    if metrics.get("risk_throttled", False):
+                        target_weights[code] = float(target_weights[code]) * throttle_mult
         top_override = set(r["ts_code"] for r in ranked[:params.cooldown_override_top_n])
+
+        if detailed_logs_enabled:
+            top_n = max(0, int(getattr(params, "log_signal_top_n", 20)))
+            snapshot_ranked = ranked[:top_n]
+            snapshot_codes = {r.get("ts_code", "") for r in snapshot_ranked if r.get("ts_code")}
+            snapshot_codes |= target_codes | {c for c, s in shares.items() if s > 0}
+            for code in snapshot_codes:
+                if code and code not in risk_metrics_by_code:
+                    risk_metrics_by_code[code] = _position_risk_metrics(store, code, signal_date, params)
+            for rank_idx, r in enumerate(snapshot_ranked, start=1):
+                code = r.get("ts_code", "")
+                metrics = risk_metrics_by_code.get(code, {})
+                signal_snapshot_records.append({
+                    "signal_date": signal_date,
+                    "trade_date": exec_date,
+                    "rank": rank_idx,
+                    "ts_code": code,
+                    "name": etf_name_map.get(code, ""),
+                    "score": float(r.get("score", np.nan)),
+                    "in_target": code in target_codes,
+                    "held_before_trade": shares.get(code, 0) > 0,
+                    "held_shares_before_trade": shares.get(code, 0),
+                    "target_weight": target_weights.get(code, np.nan),
+                    "do_rebalance": do_rebalance,
+                    "effective_holdings": effective_holdings,
+                    "target_exposure": target_exposure,
+                    "pool_size": pool_size,
+                    "is_dynamic_only": code in dynamic_only,
+                    "dynamic_prior_return": r.get("dynamic_prior_return", np.nan),
+                    "dynamic_overheat_penalized": r.get("dynamic_overheat_penalized", False),
+                    "risk_ret_std_score": metrics.get("risk_ret_std_score", np.nan),
+                    "risk_amount_cv": metrics.get("risk_amount_cv", np.nan),
+                    "risk_ret_flag": metrics.get("risk_ret_flag", False),
+                    "risk_amount_flag": metrics.get("risk_amount_flag", False),
+                    "risk_throttled": metrics.get("risk_throttled", False),
+                })
 
         # ── 6d. Get next-day open prices ──
         next_open_prices: dict[str, float] = {}
@@ -1094,6 +1367,7 @@ def run_backtest(
         daily_commission = 0.0
         daily_slippage = 0.0
         daily_part_pen = 0.0
+        day_trade_start = len(trade_records)
 
         # ── 6e. SELL: exit positions ──
         for code in list(shares.keys()):
@@ -1173,17 +1447,18 @@ def run_backtest(
                         shares.pop(code, None)
                         entry_prices.pop(code, None)
                         position_highs.pop(code, None)
+                        risk_throttled_codes.discard(code)
                 else:
                     shares[code] = 0
                     entry_prices.pop(code, None)
                     position_highs.pop(code, None)
+                    risk_throttled_codes.discard(code)
 
                 if params.cooldown_days > 0:
                     cooldown[code] = params.cooldown_days
 
-        # ── 6f. BUY: enter new positions ──
         # ── 6e2. Exposure rebalancing: partial sell to match target_exposure ──
-        if target_exposure < 0.99 and do_rebalance:
+        if do_rebalance and target_exposure < 0.99:
             total_mv = sum(shares.get(c, 0) * (store.latest_price(c, signal_date) if not np.isnan(store.latest_price(c, signal_date)) else 0)
                           for c in shares if shares.get(c, 0) > 0)
             total_equity = cash + total_mv
@@ -1228,6 +1503,83 @@ def run_backtest(
                                 "is_permanent_hold": code in permanent_hold_codes,
                                 "permanent_dip_add": False,
                             })
+
+        # ── 6e3. Position risk throttle: halve risky held positions and leave cash ──
+        if (
+            getattr(params, 'use_position_risk_throttle', False)
+            and (do_rebalance or getattr(params, 'risk_check_on_non_rebalance', True))
+        ):
+            throttle_mult = max(0.0, min(1.0, float(params.risk_exposure_multiplier)))
+            sell_frac = max(0.0, min(1.0, 1.0 - throttle_mult))
+            for code in list(shares.keys()):
+                if shares.get(code, 0) <= 0:
+                    continue
+                if code in permanent_hold_codes and params.permanent_hold_disable_stops:
+                    continue
+                metrics = risk_metrics_by_code.get(code)
+                if metrics is None:
+                    metrics = _position_risk_metrics(store, code, signal_date, params)
+                    risk_metrics_by_code[code] = metrics
+                if not metrics.get("risk_throttled", False):
+                    risk_throttled_codes.discard(code)
+                    continue
+                if code in risk_throttled_codes or sell_frac <= 0:
+                    continue
+
+                signal_px = store.latest_price(code, signal_date)
+                exec_px = next_open_prices.get(code, np.nan)
+                if np.isnan(signal_px) or signal_px <= 0 or np.isnan(exec_px) or exec_px <= 0:
+                    continue
+                shares_to_sell = int(shares[code] * sell_frac / 100) * 100
+                if shares_to_sell <= 0 or shares_to_sell >= shares[code]:
+                    continue
+
+                liq = get_liquidity(code, signal_date)
+                result = execute_sell(code, shares_to_sell, signal_px, exec_px,
+                                      entry_prices.get(code, 0), liq, params)
+                if result is None:
+                    continue
+
+                cash += result["net_proceeds"]
+                daily_commission += result["cost_detail"]["commission"] * result["gross_proceeds"]
+                daily_slippage += result["cost_detail"]["slip"] * result["gross_proceeds"]
+                daily_part_pen += result["cost_detail"]["part_pen"] * result["gross_proceeds"]
+
+                shares[code] -= result["shares"]
+                if shares[code] <= 0:
+                    shares.pop(code, None)
+                    entry_prices.pop(code, None)
+                    position_highs.pop(code, None)
+                    risk_throttled_codes.discard(code)
+                else:
+                    risk_throttled_codes.add(code)
+
+                reason = ["RISK_THROTTLE"]
+                if metrics.get("risk_ret_flag", False):
+                    reason.append("RET_STD")
+                if metrics.get("risk_amount_flag", False):
+                    reason.append("AMOUNT_CV")
+
+                trade_records.append({
+                    "date": signal_date, "trade_date": exec_date,
+                    "ts_code": code, "action": "SELL",
+                    "reason": "|".join(reason),
+                    "price": result["price"], "shares": result["shares"],
+                    "gross_proceeds": result["gross_proceeds"],
+                    "cost": result["cost_total"],
+                    "net_proceeds": result["net_proceeds"],
+                    "partial": result["partial"],
+                    "target_weight": target_weights.get(code, np.nan),
+                    "is_dynamic_only": code in dynamic_only,
+                    "is_permanent_hold": code in permanent_hold_codes,
+                    "permanent_dip_add": False,
+                    "risk_ret_std_score": metrics.get("risk_ret_std_score", np.nan),
+                    "risk_amount_cv": metrics.get("risk_amount_cv", np.nan),
+                    "risk_throttled": metrics.get("risk_throttled", False),
+                })
+
+                if result["partial"]:
+                    audit["partial_fills"] += 1
 
         # ── 6f. BUY: enter new positions ──
         if do_rebalance:
@@ -1324,6 +1676,9 @@ def run_backtest(
                         "permanent_dip_add": buy_reasons.get(code) == "PERMANENT_DIP_ADD",
                         "dynamic_prior_return": next((r.get("dynamic_prior_return", np.nan) for r in ranked if r["ts_code"] == code), np.nan),
                         "dynamic_overheat_penalized": next((r.get("dynamic_overheat_penalized", False) for r in ranked if r["ts_code"] == code), False),
+                        "risk_ret_std_score": risk_metrics_by_code.get(code, {}).get("risk_ret_std_score", np.nan),
+                        "risk_amount_cv": risk_metrics_by_code.get(code, {}).get("risk_amount_cv", np.nan),
+                        "risk_throttled": risk_metrics_by_code.get(code, {}).get("risk_throttled", False),
                     })
 
                     if result["partial"]:
@@ -1352,6 +1707,125 @@ def run_backtest(
         # Sanity check: cash >= 0
         if cash < -1.0:
             audit["nav_check_errors"] += 1
+
+        if detailed_logs_enabled:
+            cash_ratio = cash / portfolio_value if portfolio_value > 0 else np.nan
+            position_ratio = market_value / portfolio_value if portfolio_value > 0 else np.nan
+            account_records.append({
+                "signal_date": signal_date,
+                "trade_date": exec_date,
+                "portfolio_value": portfolio_value,
+                "cash": cash,
+                "cash_ratio": cash_ratio,
+                "market_value": market_value,
+                "position_ratio": position_ratio,
+                "position_count": sum(1 for s in shares.values() if s > 0),
+                "target_count": len(target_codes),
+                "pool_size": pool_size,
+                "do_rebalance": do_rebalance,
+                "target_exposure": target_exposure,
+                "effective_holdings": effective_holdings,
+                "daily_commission": daily_commission,
+                "daily_slippage": daily_slippage,
+                "daily_part_penalty": daily_part_pen,
+                "daily_cost_total": daily_commission + daily_slippage + daily_part_pen,
+            })
+
+            for code in sorted(c for c, s in shares.items() if s > 0):
+                close_px = store.latest_price(code, exec_date)
+                if np.isnan(close_px) or close_px <= 0:
+                    close_px = entry_prices.get(code, np.nan)
+                mv = shares[code] * close_px if not np.isnan(close_px) else np.nan
+                entry_px = entry_prices.get(code, np.nan)
+                position_records.append({
+                    "signal_date": signal_date,
+                    "trade_date": exec_date,
+                    "ts_code": code,
+                    "name": etf_name_map.get(code, ""),
+                    "shares": shares[code],
+                    "close_price": close_px,
+                    "market_value": mv,
+                    "weight": mv / portfolio_value if portfolio_value > 0 and not np.isnan(mv) else np.nan,
+                    "entry_price": entry_px,
+                    "pnl_from_entry": close_px / entry_px - 1.0 if entry_px and entry_px > 0 and not np.isnan(close_px) else np.nan,
+                    "target_weight": target_weights.get(code, np.nan),
+                    "is_target": code in target_codes,
+                    "is_dynamic_only": code in dynamic_only,
+                    "risk_throttled_state": code in risk_throttled_codes,
+                    "position_high": position_highs.get(code, np.nan),
+                })
+
+            day_trades = trade_records[day_trade_start:]
+            if day_trades:
+                for t in day_trades:
+                    code = t.get("ts_code", "")
+                    reason = t.get("reason", "")
+                    operation_advice_records.append({
+                        "signal_date": signal_date,
+                        "trade_date": exec_date,
+                        "ts_code": code,
+                        "name": etf_name_map.get(code, ""),
+                        "action": t.get("action", ""),
+                        "bucket": _trade_reason_bucket(reason),
+                        "reason": reason,
+                        "shares": t.get("shares", 0),
+                        "price": t.get("price", np.nan),
+                        "target_weight": t.get("target_weight", np.nan),
+                        "score": t.get("score", np.nan),
+                        "cost": t.get("cost", np.nan),
+                        "gross_cost": t.get("gross_cost", np.nan),
+                        "net_cost": t.get("net_cost", np.nan),
+                        "gross_proceeds": t.get("gross_proceeds", np.nan),
+                        "net_proceeds": t.get("net_proceeds", np.nan),
+                        "partial": t.get("partial", False),
+                        "is_dynamic_only": t.get("is_dynamic_only", code in dynamic_only),
+                        "risk_ret_std_score": t.get("risk_ret_std_score", risk_metrics_by_code.get(code, {}).get("risk_ret_std_score", np.nan)),
+                        "risk_amount_cv": t.get("risk_amount_cv", risk_metrics_by_code.get(code, {}).get("risk_amount_cv", np.nan)),
+                        "risk_throttled": t.get("risk_throttled", risk_metrics_by_code.get(code, {}).get("risk_throttled", False)),
+                    })
+            else:
+                held_codes = sorted(c for c, s in shares.items() if s > 0)
+                if held_codes:
+                    for code in held_codes:
+                        operation_advice_records.append({
+                            "signal_date": signal_date,
+                            "trade_date": exec_date,
+                            "ts_code": code,
+                            "name": etf_name_map.get(code, ""),
+                            "action": "HOLD",
+                            "bucket": "NO_TRADE",
+                            "reason": "HOLD_CURRENT_POSITION",
+                            "shares": shares.get(code, 0),
+                            "price": store.latest_price(code, exec_date),
+                            "target_weight": target_weights.get(code, np.nan),
+                            "score": np.nan,
+                            "cost": 0.0,
+                            "partial": False,
+                            "is_dynamic_only": code in dynamic_only,
+                            "risk_ret_std_score": risk_metrics_by_code.get(code, {}).get("risk_ret_std_score", np.nan),
+                            "risk_amount_cv": risk_metrics_by_code.get(code, {}).get("risk_amount_cv", np.nan),
+                            "risk_throttled": risk_metrics_by_code.get(code, {}).get("risk_throttled", False),
+                        })
+                else:
+                    operation_advice_records.append({
+                        "signal_date": signal_date,
+                        "trade_date": exec_date,
+                        "ts_code": "CASH",
+                        "name": "cash",
+                        "action": "HOLD_CASH",
+                        "bucket": "NO_TRADE",
+                        "reason": "NO_POSITION",
+                        "shares": 0,
+                        "price": np.nan,
+                        "target_weight": 0.0,
+                        "score": np.nan,
+                        "cost": 0.0,
+                        "partial": False,
+                        "is_dynamic_only": False,
+                        "risk_ret_std_score": np.nan,
+                        "risk_amount_cv": np.nan,
+                        "risk_throttled": False,
+                    })
 
         daily_records.append({
             "date": exec_date,
@@ -1385,6 +1859,11 @@ def run_backtest(
 
     # ── 8. Trade log ──
     trades = pd.DataFrame(trade_records)
+    if detailed_logs_enabled:
+        audit["account_log"] = pd.DataFrame(account_records)
+        audit["position_log"] = pd.DataFrame(position_records)
+        audit["signal_log"] = pd.DataFrame(signal_snapshot_records)
+        audit["advice_log"] = pd.DataFrame(operation_advice_records)
 
     # ── 9. NAV reconciliation check ──
     # Verify: portfolio_value ≈ cash + market_value for all days
@@ -1417,6 +1896,25 @@ def run_and_save(params: EngineParams, out_dir: Path = None):
     equity.to_csv(out_dir / f"etf_loop_equity_{suffix}.csv")
     trades.to_csv(out_dir / f"etf_loop_targets_{suffix}.csv", index=False)
     pd.DataFrame([audit["stats"]]).to_csv(out_dir / f"etf_loop_summary_{suffix}.csv", index=False)
+
+    if getattr(params, "write_detailed_logs", False):
+        account_log = audit.get("account_log", pd.DataFrame())
+        position_log = audit.get("position_log", pd.DataFrame())
+        signal_log = audit.get("signal_log", pd.DataFrame())
+        advice_log = audit.get("advice_log", pd.DataFrame())
+        account_log.to_csv(out_dir / f"etf_loop_account_{suffix}.csv", index=False)
+        position_log.to_csv(out_dir / f"etf_loop_positions_{suffix}.csv", index=False)
+        signal_log.to_csv(out_dir / f"etf_loop_signals_{suffix}.csv", index=False)
+        advice_log.to_csv(out_dir / f"etf_loop_advice_{suffix}.csv", index=False)
+        _write_detailed_log_report(
+            out_dir / f"etf_loop_daily_log_{suffix}.md",
+            params,
+            suffix,
+            account_log,
+            position_log,
+            signal_log,
+            advice_log,
+        )
 
     print(f"{params.exp_tag}: ann={audit['stats']['annual_return']*100:.2f}%, "
           f"Sharpe={audit['stats']['sharpe_ratio']:.2f}, "
