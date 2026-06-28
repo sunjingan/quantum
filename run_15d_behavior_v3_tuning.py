@@ -24,6 +24,7 @@ COST = {"open_cost": 0.00015, "close_cost": 0.00015, "slippage": 0.0002}
 LONG_START = "2013-07-01"
 LONG_END = "2026-06-25"
 LOOKBACK = 25
+FORCE_RERUN = True
 
 DIAG_TAGS = {
     "Current": "SEQ_LONG_2013_2026_Current",
@@ -93,7 +94,7 @@ def load_or_run(tag: str, start: str, end: str, trading_start: str, extra: dict)
     params = build_base_params(start, end, tag, trading_start)
     params = EngineParams(**{**params.__dict__, **extra})
     eq_path, tr_path, sm_path = result_paths(tag, start, end)
-    if eq_path.exists() and tr_path.exists() and sm_path.exists():
+    if not FORCE_RERUN and eq_path.exists() and tr_path.exists() and sm_path.exists():
         equity = pd.read_csv(eq_path, parse_dates=["date"]).set_index("date").sort_index()
         trades = pd.read_csv(tr_path)
         stats = pd.read_csv(sm_path).iloc[0].to_dict()
@@ -228,6 +229,7 @@ def main() -> None:
         "- window: `adaptive_window=15`",
         "- cost: commission `1.5bp` + slippage `2bp` per side",
         "- execution: signal-day close -> next trading day open, no signal-day close fallback",
+        "- data source: current code + current engine, rerun in this pass",
         "- control rule: diagnostics only read existing outputs; tuning block changes one axis at a time",
         "",
         "## Repro Command",

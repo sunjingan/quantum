@@ -14,6 +14,9 @@ from strategies.etf_loop_engine import EngineParams, run_and_save
 
 OUT = BASE_DIR / "outputs" / "etf_loop"
 OUT.mkdir(parents=True, exist_ok=True)
+REPORT_DIR = OUT / "F2_CAP_MA60_deep_dive"
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+TAG_PREFIX = "LONGPERIOD_FIX1"
 
 START = "2013-07-01"
 END = "2026-06-25"
@@ -51,10 +54,10 @@ VARIANTS = {
 }
 
 def run_one(pool_name, variant_name, variant_extra, pool_cfg):
-    tag = f"LONGPERIOD_{pool_name}_{variant_name.replace(' ','').replace('(','').replace(')','').replace('+','_')}"
+    tag = f"{TAG_PREFIX}_{pool_name}_{variant_name.replace(' ','').replace('(','').replace(')','').replace('+','_')}"
     extra = {**pool_cfg["base_extra"], **variant_extra}
     
-    params = make_config("F2_CAP_MA60" if pool_name == "F2_CAP_MA60" else "F2_STATIC",
+    params = make_config("F2_CAP_MA60" if pool_name == "F2_CAP_MA60" else "F2_STATIC_BASE",
                          pool_cfg["pit"], pool_cfg["f2"], pool_cfg["f2_orig"],
                          tag, extra, START, END)
     params_dict = {**params.__dict__, **extra, "start": START, "end": END, "exp_tag": tag,
@@ -87,11 +90,13 @@ def main():
     print("=" * 90)
     
     results = {}
+    rows = []
     for pool_name, pool_cfg in POOL_CONFIGS.items():
         print(f"\n── {pool_name} ──")
         for var_name, var_extra in VARIANTS.items():
             key = f"{pool_name}|{var_name}"
             results[key] = run_one(pool_name, var_name, var_extra, pool_cfg)
+            rows.append({"pool": pool_name, "variant": var_name, **results[key]})
     
     # ── Print comparison table ──
     for pool_name in POOL_CONFIGS:
@@ -127,6 +132,29 @@ def main():
                 dsharpe = s.get('sharpe_ratio', 0) - base.get('sharpe_ratio', 0)
                 ddd = s.get('max_drawdown', 0) - base.get('max_drawdown', 0)
                 print(f"  {var_name:<25s} {dann*100:+7.2f}% {dsharpe:+6.2f} {ddd*100:+7.2f}%")
+
+    df = pd.DataFrame(rows)
+    csv_path = REPORT_DIR / "long_period_optimization_fix1.csv"
+    df.to_csv(csv_path, index=False)
+    md_path = REPORT_DIR / "long_period_optimization_fix1.md"
+    lines = [
+        "# Long Period Optimization FIX1",
+        "",
+        "- window: 2013-07-01 to 2026-06-25",
+        "- friend_mode: not used",
+        "- dynamic cap enforced after vol/score weighting",
+        "",
+        "| pool | variant | ann | sharpe | dd | final |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for _, r in df.sort_values(["pool", "annual_return"], ascending=[True, False]).iterrows():
+        lines.append(
+            f"| {r['pool']} | {r['variant']} | {r['annual_return']*100:.2f}% | "
+            f"{r['sharpe_ratio']:.2f} | {r['max_drawdown']*100:.2f}% | {r['final_value']:.0f} |"
+        )
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\nSaved: {csv_path}")
+    print(f"Saved: {md_path}")
     
     print(f"\nDone. Results saved in {OUT}")
 

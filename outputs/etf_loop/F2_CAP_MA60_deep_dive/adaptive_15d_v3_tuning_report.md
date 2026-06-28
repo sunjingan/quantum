@@ -6,6 +6,7 @@
 - window: `adaptive_window=15`
 - cost: commission `1.5bp` + slippage `2bp` per side
 - execution: signal-day close -> next trading day open, no signal-day close fallback
+- data source: current code + current engine, rerun in this pass
 - control rule: diagnostics only read existing outputs; tuning block changes one axis at a time
 
 ## Repro Command
@@ -117,15 +118,15 @@ source activate.sh && python run_15d_behavior_v3_tuning.py
 | 2015 | 34.12% | -8.58% | 244 |
 | 2016 | 14.27% | -6.86% | 244 |
 | 2017 | 13.70% | -6.60% | 244 |
-| 2018 | -15.89% | -21.87% | 243 |
-| 2019 | 52.51% | -10.81% | 244 |
-| 2020 | 61.11% | -21.49% | 243 |
-| 2021 | 11.27% | -16.02% | 243 |
-| 2022 | 17.51% | -19.97% | 242 |
-| 2023 | 16.28% | -9.04% | 242 |
-| 2024 | 24.15% | -19.92% | 242 |
-| 2025 | 180.63% | -15.08% | 243 |
-| 2026 | 109.77% | -16.15% | 110 |
+| 2018 | -0.62% | -12.46% | 243 |
+| 2019 | 50.90% | -10.82% | 244 |
+| 2020 | 38.52% | -19.66% | 243 |
+| 2021 | 21.43% | -13.84% | 243 |
+| 2022 | 31.21% | -15.17% | 242 |
+| 2023 | 17.06% | -8.78% | 242 |
+| 2024 | 29.58% | -18.16% | 242 |
+| 2025 | 169.63% | -14.17% | 243 |
+| 2026 | 109.76% | -16.15% | 110 |
 
 ### N Distribution
 
@@ -142,24 +143,24 @@ source activate.sh && python run_15d_behavior_v3_tuning.py
 
 | horizon | N | count | mean | median |
 |---:|---:|---:|---:|---:|
-| 5 | 0 | 80 | 0.02% | 0.00% |
-| 5 | 1 | 164 | 0.33% | 0.05% |
-| 5 | 2 | 508 | 1.06% | 0.29% |
-| 5 | 3 | 474 | 0.77% | 0.13% |
-| 5 | 4 | 617 | 0.82% | 0.05% |
+| 5 | 0 | 80 | 0.15% | 0.00% |
+| 5 | 1 | 164 | 0.52% | 0.05% |
+| 5 | 2 | 508 | 1.18% | 0.32% |
+| 5 | 3 | 474 | 0.78% | 0.14% |
+| 5 | 4 | 617 | 0.80% | 0.05% |
 | 5 | 5 | 1280 | 0.60% | 0.10% |
-| 10 | 0 | 80 | 0.40% | 0.00% |
-| 10 | 1 | 164 | 0.84% | 0.11% |
-| 10 | 2 | 506 | 2.25% | 0.70% |
-| 10 | 3 | 471 | 1.32% | 0.19% |
-| 10 | 4 | 617 | 1.67% | 0.52% |
-| 10 | 5 | 1280 | 1.23% | 0.37% |
-| 20 | 0 | 80 | 1.42% | 2.13% |
-| 20 | 1 | 164 | 0.40% | 0.19% |
-| 20 | 2 | 505 | 4.51% | 1.96% |
-| 20 | 3 | 468 | 2.66% | 0.78% |
-| 20 | 4 | 611 | 3.61% | 1.38% |
-| 20 | 5 | 1280 | 2.66% | 1.12% |
+| 10 | 0 | 80 | 0.60% | 0.01% |
+| 10 | 1 | 164 | 0.86% | 0.12% |
+| 10 | 2 | 506 | 2.45% | 0.77% |
+| 10 | 3 | 471 | 1.47% | 0.23% |
+| 10 | 4 | 617 | 1.66% | 0.52% |
+| 10 | 5 | 1280 | 1.22% | 0.36% |
+| 20 | 0 | 80 | 1.52% | 1.63% |
+| 20 | 1 | 164 | 0.53% | 0.18% |
+| 20 | 2 | 505 | 4.98% | 1.93% |
+| 20 | 3 | 468 | 3.04% | 0.75% |
+| 20 | 4 | 611 | 3.62% | 1.34% |
+| 20 | 5 | 1280 | 2.61% | 1.11% |
 
 ### Forward Benchmark Return By N
 
@@ -186,9 +187,9 @@ source activate.sh && python run_15d_behavior_v3_tuning.py
 
 ### Trading Summary
 
-- trades: 5870
-- buys: 3392
-- sells: 2478
+- trades: 5877
+- buys: 3395
+- sells: 2482
 
 ## Exph_v3
 
@@ -281,13 +282,13 @@ source activate.sh && python run_15d_behavior_v3_tuning.py
 
 | variant | axis | annual | sharpe | dd | trades |
 |---|---|---:|---:|---:|---:|
-| Exph_v3_n_down1 | N | 32.86% | 1.57 | -20.85% | 10147 |
-| Exph_v3_exp_looser | Exposure | 32.80% | 1.60 | -19.94% | 10874 |
-| Exph_v3_base | N | 32.60% | 1.59 | -20.11% | 11005 |
-| Exph_v3_exp_tighter | Exposure | 32.45% | 1.59 | -20.24% | 11215 |
-| Exph_v3_n_up1 | N | 31.40% | 1.56 | -21.49% | 11512 |
+| Exph_v3_exp_looser | Exposure | 27.33% | 1.51 | -17.30% | 8387 |
+| Exph_v3_n_down1 | N | 26.35% | 1.47 | -16.72% | 7702 |
+| Exph_v3_base | N | 26.14% | 1.47 | -17.53% | 8332 |
+| Exph_v3_exp_tighter | Exposure | 25.07% | 1.44 | -17.74% | 8483 |
+| Exph_v3_n_up1 | N | 24.96% | 1.42 | -18.26% | 8692 |
 
-- baseline control: annual 32.60%, sharpe 1.59, dd -20.11%
+- baseline control: annual 26.14%, sharpe 1.47, dd -17.53%
 
 ## Local Tuning: 2026_NOWARMUP
 
@@ -296,22 +297,16 @@ source activate.sh && python run_15d_behavior_v3_tuning.py
 
 | variant | axis | annual | sharpe | dd | trades |
 |---|---|---:|---:|---:|---:|
-| Exph_v3_exp_looser | Exposure | 109.05% | 3.59 | -15.80% | 557 |
-| Exph_v3_base | N | 107.17% | 3.54 | -15.86% | 568 |
-| Exph_v3_exp_tighter | Exposure | 105.30% | 3.48 | -15.89% | 571 |
-| Exph_v3_n_up1 | N | 104.98% | 3.61 | -15.31% | 599 |
-| Exph_v3_n_down1 | N | 104.70% | 3.23 | -16.45% | 506 |
+| Exph_v3_exp_looser | Exposure | 91.86% | 3.69 | -12.36% | 358 |
+| Exph_v3_base | N | 87.66% | 3.67 | -11.84% | 358 |
+| Exph_v3_exp_tighter | Exposure | 83.81% | 3.65 | -11.31% | 367 |
+| Exph_v3_n_down1 | N | 83.45% | 3.37 | -12.93% | 324 |
+| Exph_v3_n_up1 | N | 82.38% | 3.64 | -11.88% | 369 |
 
-- baseline control: annual 107.17%, sharpe 3.54, dd -15.86%
+- baseline control: annual 87.66%, sharpe 3.67, dd -11.84%
 
 ## Notes
 
 - diagnostics are descriptive only; they do not change parameters
 - tuning variants are single-axis perturbations around `Exph_v3`
 - keep `15d` fixed throughout this script
-
-## Conclusion
-
-- 15d behavior diagnosis: lower `N` states are associated with higher forward portfolio returns, while benchmark forward returns are weakest around the mid `N=3/4` regime. This supports the idea that the adaptive N signal is doing real timing work instead of just adding noise.
-- Local tuning: `Exph_v3_exp_looser` is the best one-axis perturbation in this round. It slightly improves annual return and Sharpe, and keeps drawdown better than the base case on both long-period and 2026 nowarmup tests.
-- `N_down1` has the highest long-period annual return among the N-only variants, but it weakens 2026 drawdown and Sharpe. I would not promote it over `Exph_v3_exp_looser` on current evidence.

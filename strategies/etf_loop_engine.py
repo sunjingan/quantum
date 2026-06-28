@@ -1281,7 +1281,7 @@ def run_backtest(
                         continue
 
                     current_val = shares.get(code, 0) * exec_px
-                    target_value = total_value * target_weights.get(code, 1.0 / n_active)
+                    target_value = investable * target_weights.get(code, 1.0 / n_active)
                     diff = target_value - current_val
                     if diff <= 0:
                         continue

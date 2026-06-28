@@ -3,6 +3,7 @@
 - benchmark: `sh000300`
 - cost: 1.5bp commission + 2bp slippage per side
 - order: window scan -> baseline threshold controls -> wide A/B -> V3 exp/hold split
+- data source: current code + current engine, rerun in this pass
 - control rule: each block changes one axis only
 
 ## window_scan
@@ -41,29 +42,22 @@
 | 2026_NOWARMUP | WideA | 115.15% | 3.39 | -16.33% | 1,035,666 | 288 |
 | 2026_NOWARMUP | WideB | 101.17% | 3.26 | -17.15% | 949,553 | 321 |
 | LONG_2013_2026 | Current | 39.81% | 1.57 | -25.44% | 48,555,145 | 5041 |
-| LONG_2013_2026 | WideA | 35.64% | 1.50 | -22.45% | 30,331,912 | 5870 |
-| LONG_2013_2026 | WideB | 31.67% | 1.46 | -24.22% | 19,506,345 | 6617 |
+| LONG_2013_2026 | WideA | 37.12% | 1.62 | -19.66% | 37,363,494 | 5877 |
+| LONG_2013_2026 | WideB | 32.81% | 1.52 | -21.80% | 22,590,142 | 6601 |
 
 ## v3_exp_hold
 
 | period | variant | annual | sharpe | dd | final | trades |
 |---|---|---:|---:|---:|---:|---:|
-| 2026_NOWARMUP | Exph_v3 | 107.17% | 3.54 | -15.86% | 989,720 | 568 |
-| 2026_NOWARMUP | Exph_v5_div_lowbear | 105.38% | 3.30 | -16.51% | 974,751 | 539 |
-| 2026_NOWARMUP | Exph_v6_very_high_div | 104.98% | 3.61 | -15.31% | 977,748 | 599 |
-| 2026_NOWARMUP | Exph_v2_lower_bear | 101.62% | 3.16 | -16.78% | 950,372 | 533 |
-| 2026_NOWARMUP | Exph_base | 100.95% | 3.10 | -16.73% | 945,185 | 501 |
-| 2026_NOWARMUP | Exph_v4_smoother | 100.09% | 3.04 | -16.91% | 939,111 | 453 |
-| LONG_2013_2026 | Exph_v3 | 32.60% | 1.59 | -20.11% | 22,676,268 | 11005 |
-| LONG_2013_2026 | Exph_v4_smoother | 32.36% | 1.53 | -20.77% | 21,647,653 | 9685 |
-| LONG_2013_2026 | Exph_v5_div_lowbear | 32.30% | 1.55 | -21.20% | 21,609,336 | 10703 |
-| LONG_2013_2026 | Exph_base | 32.17% | 1.53 | -20.88% | 21,155,499 | 10070 |
-| LONG_2013_2026 | Exph_v2_lower_bear | 31.56% | 1.50 | -21.24% | 19,612,310 | 10641 |
-| LONG_2013_2026 | Exph_v6_very_high_div | 31.40% | 1.56 | -21.49% | 19,678,791 | 11512 |
-
-## Key Takeaways
-
-- `20dRet` window scan: 15d is the best long-period window among the tested set, while 5d/10d are more aggressive and 60d is too slow.
-- Baseline threshold controls: fixed thresholds are no-ops on fixed-5; rolling P60 is the only method that materially changes behavior, but it lowers Sharpe and increases drawdown on both periods.
-- WideA/WideB: both reduce drawdown versus Current, but also lower annual return; WideA is the better of the two on both periods.
-- V3 exp/hold split: `Exph_v3` is the best of the tested split variants on both periods. It improves DD versus Current-style N-only control while keeping long-period Sharpe the best in this block.
+| 2026_NOWARMUP | Exph_v3 | 87.66% | 3.67 | -11.84% | 879,433 | 358 |
+| 2026_NOWARMUP | Exph_v4_smoother | 83.62% | 3.20 | -13.65% | 853,005 | 326 |
+| 2026_NOWARMUP | Exph_v6_very_high_div | 82.38% | 3.64 | -11.88% | 850,713 | 369 |
+| 2026_NOWARMUP | Exph_base | 79.96% | 3.20 | -13.07% | 834,129 | 322 |
+| 2026_NOWARMUP | Exph_v5_div_lowbear | 75.75% | 3.37 | -11.56% | 814,229 | 337 |
+| 2026_NOWARMUP | Exph_v2_lower_bear | 72.14% | 3.16 | -11.86% | 794,574 | 331 |
+| LONG_2013_2026 | Exph_v4_smoother | 26.94% | 1.45 | -17.65% | 11,687,466 | 7706 |
+| LONG_2013_2026 | Exph_v3 | 26.14% | 1.47 | -17.53% | 10,789,967 | 8332 |
+| LONG_2013_2026 | Exph_base | 26.07% | 1.43 | -18.29% | 10,573,093 | 7683 |
+| LONG_2013_2026 | Exph_v6_very_high_div | 24.96% | 1.42 | -18.26% | 9,342,331 | 8692 |
+| LONG_2013_2026 | Exph_v5_div_lowbear | 23.46% | 1.37 | -17.29% | 7,811,795 | 7931 |
+| LONG_2013_2026 | Exph_v2_lower_bear | 23.37% | 1.33 | -19.29% | 7,668,726 | 7809 |

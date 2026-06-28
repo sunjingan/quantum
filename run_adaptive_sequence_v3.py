@@ -21,6 +21,7 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 COST = {"open_cost": 0.00015, "close_cost": 0.00015, "slippage": 0.0002}
 BENCHMARK = "sh000300"
+FORCE_RERUN = True
 PERIODS = [
     ("2026_NOWARMUP", "2025-10-01", "2026-06-25", "2026-01-02"),
     ("LONG_2013_2026", "2013-07-01", "2026-06-25", ""),
@@ -56,7 +57,7 @@ def run_case(tag: str, start: str, end: str, extra: dict) -> dict:
     eq_path = OUT / f"etf_loop_equity_{suffix(tag, start, end)}.csv"
     tr_path = OUT / f"etf_loop_targets_{suffix(tag, start, end)}.csv"
     sm_path = OUT / f"etf_loop_summary_{suffix(tag, start, end)}.csv"
-    if eq_path.exists() and tr_path.exists() and sm_path.exists():
+    if not FORCE_RERUN and eq_path.exists() and tr_path.exists() and sm_path.exists():
         stats = pd.read_csv(sm_path).iloc[0].to_dict()
     else:
         _, trades, audit = run_and_save(params, OUT)
@@ -229,6 +230,8 @@ def main() -> None:
         f"- benchmark: `{BENCHMARK}`",
         "- cost: 1.5bp commission + 2bp slippage per side",
         "- order: window scan -> baseline threshold controls -> wide A/B -> V3 exp/hold split",
+        "- data source: current code + current engine, rerun in this pass",
+        "- control rule: each block changes one axis only",
         "",
     ]
     for group in ["window_scan", "threshold_baseline", "wide_ab", "v3_exp_hold"]:
