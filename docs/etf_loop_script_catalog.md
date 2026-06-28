@@ -30,6 +30,7 @@
 - `runs/etf_loop/run_detailed_trade_log.py`：对指定候选策略生成回测内原生日志，包括每日账户、每日持仓、TopN 信号快照和下一交易日操作建议。
 - `runs/etf_loop/run_minute_execution_backtest.py`：独立分钟级执行层回测，复用日线候选信号，测试 T+1 09:35-10:30 VWAP/TWAP、尾盘 VWAP、T+2、容量、参与率、涨跌停和 actual exposure。
 - `runs/etf_loop/run_friend_intraday_replication.py`：使用本地 ETF 1 分钟/5 分钟数据复现 friend 9-ETF 单仓策略，测试 09:50 信号和不同 T+0/T+1 成交假设。
+- `runs/etf_loop/run_friend_f2pit_strategy.py`：独立 friend-style 优化实验，使用 friend 的 09:50 加权回归动量思想，但替换为 F2_v3 静态核心池 + G2 PIT 动态池，并加入成本、滑点、溢价惩罚、动态池过热惩罚和止损等风控；不修改主 ETF Loop 策略。
 
 ## 2. 结果分析脚本
 
