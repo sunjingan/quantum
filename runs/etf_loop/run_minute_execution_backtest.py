@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_detailed_trade_log import build_params  # noqa: E402
 from strategies.etf_loop_engine import run_and_save  # noqa: E402
+from strategies.etf_loop_strategy import ETFDailyStore, SectorProsperityCache  # noqa: E402
 from strategies.etf_loop_strategy import _lot_floor  # noqa: E402
 
 
@@ -153,17 +154,74 @@ def summarize(equity: pd.DataFrame) -> dict[str, float]:
 
 
 class LocalMinuteStore:
-    def __init__(self, codes: list[str], start: str, end: str, frequency: str = "1min") -> None:
+    def __init__(
+        self,
+        codes: list[str],
+        start: str,
+        end: str,
+        frequency: str = "1min",
+        price_adjustment: str = "none",
+    ) -> None:
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         self.frequency = frequency
+        self.price_adjustment = price_adjustment
         self.frames: dict[str, pd.DataFrame] = {}
         self._day_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
+        self._adjustment_cache: dict[tuple[str, pd.Timestamp], float] = {}
+        self.daily_store = self._build_daily_store(codes) if price_adjustment == "engine" else None
         for code in sorted(set(codes)):
             df = self._load_code(code)
             if not df.empty:
                 self.frames[code] = df
         self.calendar = self._build_calendar()
+
+    def _build_daily_store(self, codes: list[str]) -> ETFDailyStore | None:
+        cache = SectorProsperityCache(PROJECT_ROOT / "config" / "tushare_token.txt", PROJECT_ROOT / "data" / "tushare_cache")
+        store = ETFDailyStore(cache, sorted(set(codes)), str(self.start), str(self.end))
+        return store if store.ts_codes else None
+
+    def _engine_price_scale(self, code: str, date: pd.Timestamp) -> float:
+        if self.daily_store is None:
+            return 1.0
+        key = (code, pd.Timestamp(date))
+        if key in self._adjustment_cache:
+            return self._adjustment_cache[key]
+        scale = 1.0
+        ds = self.daily_store
+        date = pd.Timestamp(date)
+        try:
+            if (
+                code in ds.open.columns
+                and code in ds.signal_open.columns
+                and date in ds.open.index
+                and date in ds.signal_open.index
+            ):
+                raw = float(ds.open.at[date, code])
+                adj = float(ds.signal_open.at[date, code])
+                if pd.notna(raw) and raw > 0 and pd.notna(adj) and adj > 0:
+                    scale = adj / raw
+            if scale == 1.0 and code in ds.raw_close.columns and code in ds.signal_close.columns:
+                raw = float(ds.raw_close.at[date, code]) if date in ds.raw_close.index else np.nan
+                adj = float(ds.signal_close.at[date, code]) if date in ds.signal_close.index else np.nan
+                if pd.notna(raw) and raw > 0 and pd.notna(adj) and adj > 0:
+                    scale = adj / raw
+        except Exception:
+            scale = 1.0
+        self._adjustment_cache[key] = scale
+        return scale
+
+    def _apply_engine_adjustment(self, code: str, df: pd.DataFrame) -> pd.DataFrame:
+        if self.price_adjustment != "engine" or self.daily_store is None or df.empty:
+            return df
+        out = df.copy()
+        scales = out["date"].map(lambda d: self._engine_price_scale(code, pd.Timestamp(d))).astype(float)
+        for col in ["open", "high", "low", "close", "prev_close", "limit_up", "limit_down"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce") * scales.to_numpy()
+        if "amount" in out.columns:
+            out["amount"] = pd.to_numeric(out["amount"], errors="coerce") * scales.to_numpy()
+        return out
 
     def _load_code(self, ts_code: str) -> pd.DataFrame:
         local = ts_code.split(".")[0]
@@ -210,6 +268,7 @@ class LocalMinuteStore:
         out = pd.concat(parts, ignore_index=True)
         out = out[(out["date"] >= self.start - pd.DateOffset(days=5)) & (out["date"] <= self.end + pd.DateOffset(days=5))]
         out = out.drop_duplicates(["date", "time"], keep="last").sort_values(["date", "time"])
+        out = self._apply_engine_adjustment(ts_code, out)
         return out
 
     def _build_calendar(self) -> pd.DatetimeIndex:
@@ -242,6 +301,13 @@ class LocalMinuteStore:
         px = rows["close"].dropna()
         return float(px.iloc[-1]) if len(px) else np.nan
 
+    def valuation_close_price(self, code: str, date: pd.Timestamp) -> float:
+        if self.price_adjustment == "engine" and self.daily_store is not None:
+            px = self.daily_store.latest_price(code, pd.Timestamp(date))
+            if pd.notna(px) and px > 0:
+                return float(px)
+        return self.close_price(code, date)
+
     def fill_context(self, code: str, date: pd.Timestamp, mode: str) -> FillContext | None:
         spec = EXECUTION_MODES[mode]
         day = self.day_rows(code, date)
@@ -268,7 +334,15 @@ class LocalMinuteStore:
             raw_price = float(row.get(spec.get("field", "open"), np.nan))
         elif spec["kind"] == "vwap":
             if window_turnover > 0 and window_volume > 0:
-                raw_price = window_turnover / window_volume
+                if self.price_adjustment == "engine":
+                    valid = window[["close", "volume"]].dropna()
+                    valid = valid[valid["volume"] > 0]
+                    if not valid.empty:
+                        raw_price = float((valid["close"].astype(float) * valid["volume"].astype(float)).sum() / valid["volume"].astype(float).sum())
+                    else:
+                        raw_price = np.nan
+                else:
+                    raw_price = window_turnover / window_volume
             else:
                 raw_price = float(window["close"].dropna().mean())
         elif spec["kind"] == "twap":

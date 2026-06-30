@@ -145,6 +145,7 @@ class EngineParams:
     open_cost: float = 0.0001      # buy-side commission
     close_cost: float = 0.0001     # sell-side commission
     slippage: float = 0.0001       # fixed slippage (used when dynamic_cost=False)
+    fixed_price_slippage: float = 0.0  # JoinQuant-style fixed yuan/share price slippage
     use_dynamic_cost: bool = False
     liquidity_lookback: int = 60   # days for avg amount calculation
     # Tiered liquidity slippage (extra on top of commission):
@@ -236,6 +237,15 @@ class EngineParams:
     risk_exposure_multiplier: float = 0.5
     risk_check_on_non_rebalance: bool = True
 
+    # ── Target correlation de-duplication ──
+    # Default-off.  When enabled, select high-score ETFs greedily but skip a
+    # candidate if its trailing return correlation with any already-selected
+    # ETF is above the threshold.  Uses signal-date-visible history only.
+    use_correlation_filter: bool = False
+    correlation_lookback: int = 60
+    correlation_threshold: float = 0.85
+    correlation_backfill: bool = True
+
     # ── Detailed trading logs ──
     write_detailed_logs: bool = False
     log_signal_top_n: int = 20
@@ -312,6 +322,12 @@ def execute_sell(
     if np.isnan(exec_px) or exec_px <= 0:
         return None  # no valid price
 
+    raw_exec_px = exec_px
+    if params.fixed_price_slippage > 0:
+        exec_px = max(0.0, exec_px - params.fixed_price_slippage)
+        if exec_px <= 0:
+            return None
+
     trade_value = shares_held * exec_px
     cost = compute_dynamic_cost(avg_amount, trade_value, params, side="sell")
     if cost["rejected"]:
@@ -328,6 +344,7 @@ def execute_sell(
             "price": exec_px, "gross_proceeds": trade_value,
             "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
             "net_proceeds": proceeds,
+            "raw_price": raw_exec_px,
             "cost_detail": cost,
         }
 
@@ -338,6 +355,7 @@ def execute_sell(
         "price": exec_px, "gross_proceeds": trade_value,
         "cost_total": trade_value * (cost["commission"] + cost["slip"] + cost["part_pen"]),
         "net_proceeds": proceeds,
+        "raw_price": raw_exec_px,
         "cost_detail": cost,
     }
 
@@ -355,6 +373,10 @@ def execute_buy(
         return None
     if available_cash <= 0 or target_value <= 0:
         return None
+
+    raw_exec_px = exec_px
+    if params.fixed_price_slippage > 0:
+        exec_px = exec_px + params.fixed_price_slippage
 
     # Estimate shares based on available cash
     total_cost_rate = params.open_cost + params.slippage  # rough estimate
@@ -397,6 +419,7 @@ def execute_buy(
         "price": exec_px, "gross_cost": trade_value,
         "cost_total": total_cost,
         "net_cost": trade_value + total_cost,
+        "raw_price": raw_exec_px,
         "cost_detail": cost,
     }
 
@@ -754,6 +777,69 @@ def _select_targets(
         return target_codes, {}
 
     return target_codes, _weight_targets(target_codes, params, dynamic_only)
+
+
+def _filter_ranked_by_correlation(
+    ranked: list[dict],
+    store: ETFDailyStore,
+    signal_date: pd.Timestamp,
+    params: EngineParams,
+    n_target: int,
+) -> list[dict]:
+    """Greedy high-score selection with trailing-return correlation de-dup."""
+    if not ranked or n_target <= 0 or not getattr(params, "use_correlation_filter", False):
+        return ranked
+
+    lookback = int(max(5, getattr(params, "correlation_lookback", 60)))
+    threshold = float(getattr(params, "correlation_threshold", 0.85))
+    backfill = bool(getattr(params, "correlation_backfill", True))
+    selected: list[dict] = []
+    selected_returns: dict[str, np.ndarray] = {}
+    deferred: list[dict] = []
+
+    for item in ranked:
+        code = item.get("ts_code")
+        if not code:
+            continue
+        prices = store.price_series(code, signal_date, lookback)
+        if len(prices) < lookback + 1:
+            deferred.append(item)
+            continue
+        rets = np.diff(prices) / prices[:-1]
+        if len(rets) < lookback or np.any(~np.isfinite(rets)):
+            deferred.append(item)
+            continue
+
+        too_correlated = False
+        for sel_code, sel_rets in selected_returns.items():
+            n = min(len(rets), len(sel_rets))
+            if n < max(5, lookback // 2):
+                continue
+            corr = np.corrcoef(rets[-n:], sel_rets[-n:])[0, 1]
+            if np.isfinite(corr) and corr >= threshold:
+                too_correlated = True
+                item["corr_filtered_by"] = sel_code
+                item["corr_filtered_value"] = float(corr)
+                break
+        if too_correlated:
+            deferred.append(item)
+            continue
+
+        selected.append(item)
+        selected_returns[code] = rets
+        item["corr_selected"] = True
+        if len(selected) >= n_target:
+            # Keep the rest behind selected so logs still contain candidates.
+            if not backfill:
+                return selected
+            selected_codes = {r.get("ts_code") for r in selected}
+            return selected + [r for r in ranked if r.get("ts_code") not in selected_codes]
+
+    # If strict de-correlation cannot fill N, append deferred in original score order.
+    if not backfill:
+        return selected
+    selected_codes = {r.get("ts_code") for r in selected}
+    return selected + [r for r in ranked if r.get("ts_code") not in selected_codes]
 
 
 def _weight_targets(
@@ -1266,6 +1352,9 @@ def run_backtest(
                         ranked = []
                         effective_holdings = 0
 
+            if getattr(params, 'use_correlation_filter', False) and ranked and effective_holdings > 1:
+                ranked = _filter_ranked_by_correlation(ranked, store, signal_date, params, effective_holdings)
+
             target_codes, target_weights = _select_targets(ranked, params, core_set, dynamic_only, effective_holdings)
             target_codes, target_weights = _apply_switch_score_margin(
                 target_codes, ranked, shares, params, dynamic_only
@@ -1429,7 +1518,7 @@ def run_backtest(
                     "date": signal_date, "trade_date": exec_date,
                     "ts_code": code, "action": "SELL",
                     "reason": "|".join(reason) if reason else "REBALANCE",
-                    "price": result["price"], "shares": result["shares"],
+                    "price": result["price"], "raw_price": result.get("raw_price", np.nan), "shares": result["shares"],
                     "gross_proceeds": result["gross_proceeds"],
                     "cost": result["cost_total"],
                     "net_proceeds": result["net_proceeds"],
@@ -1493,7 +1582,7 @@ def run_backtest(
                                 "date": signal_date, "trade_date": exec_date,
                                 "ts_code": code, "action": "SELL",
                                 "reason": "EXPOSURE_REBALANCE",
-                                "price": result["price"], "shares": result["shares"],
+                                "price": result["price"], "raw_price": result.get("raw_price", np.nan), "shares": result["shares"],
                                 "gross_proceeds": result["gross_proceeds"],
                                 "cost": result["cost_total"],
                                 "net_proceeds": result["net_proceeds"],
@@ -1564,7 +1653,7 @@ def run_backtest(
                     "date": signal_date, "trade_date": exec_date,
                     "ts_code": code, "action": "SELL",
                     "reason": "|".join(reason),
-                    "price": result["price"], "shares": result["shares"],
+                    "price": result["price"], "raw_price": result.get("raw_price", np.nan), "shares": result["shares"],
                     "gross_proceeds": result["gross_proceeds"],
                     "cost": result["cost_total"],
                     "net_proceeds": result["net_proceeds"],
@@ -1654,17 +1743,18 @@ def run_backtest(
                     old_shares = shares.get(code, 0)
                     shares[code] = old_shares + result["shares"]
                     if old_shares == 0:
-                        entry_prices[code] = exec_px
-                        position_highs[code] = exec_px
+                        entry_prices[code] = result["price"]
+                        position_highs[code] = result["price"]
                     else:
                         entry_prices[code] = (old_shares * entry_prices[code]
-                                             + result["shares"] * exec_px) / (old_shares + result["shares"])
+                                             + result["shares"] * result["price"]) / (old_shares + result["shares"])
 
                     trade_records.append({
                         "date": signal_date, "trade_date": exec_date,
                         "ts_code": code, "action": "BUY",
                         "reason": buy_reasons.get(code, "RANK_IN"),
                         "price": result["price"], "shares": result["shares"],
+                        "raw_price": result.get("raw_price", np.nan),
                         "gross_cost": result["gross_cost"],
                         "cost": result["cost_total"],
                         "net_cost": result["net_cost"],

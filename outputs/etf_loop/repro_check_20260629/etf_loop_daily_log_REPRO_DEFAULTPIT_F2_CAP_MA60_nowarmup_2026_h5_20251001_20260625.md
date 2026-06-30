@@ -1,0 +1,87 @@
+# ETF Loop Detailed Trading Log
+
+- tag: `REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026`
+- suffix: `REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026_h5_20251001_20260625`
+- signal rule: signal on T close, execute on future trading day by `open`
+- note: CSV files contain the full daily logs; this Markdown shows the latest snapshot and recent actions.
+
+## Latest Account
+
+- signal_date: `2026-06-18 00:00:00`
+- trade_date: `2026-06-22 00:00:00`
+- nav: `898160.37`
+- cash_ratio: `0.29%`
+- position_ratio: `99.71%`
+- position_count: `5`
+- target_count: `5`
+- target_exposure: `100.00%`
+- effective_holdings: `5`
+
+## Latest Holdings
+
+| code | name | shares | close | market value | weight | entry | pnl from entry |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 159516.SZ | 国泰中证半导体材料设备主题ETF | 61500 | 3.1440 | 193357.77 | 21.53% | 2.6821 | 17.22% |
+| 513520.SH | 华夏野村日经225ETF(QDII) | 69600 | 2.6065 | 181413.48 | 20.20% | 2.4193 | 7.74% |
+| 515880.SH | 国泰中证全指通信设备ETF | 32000 | 5.5772 | 178469.98 | 19.87% | 5.1032 | 9.29% |
+| 513100.SH | 国泰纳斯达克100ETF(QDII) | 76900 | 2.2497 | 173005.73 | 19.26% | 2.3107 | -2.64% |
+| 513400.SH | 鹏华道琼斯工业平均ETF(QDII) | 130900 | 1.2931 | 169270.10 | 18.85% | 1.2952 | -0.16% |
+
+## Latest Next-Day Operation Advice
+
+| action | bucket | code | name | reason | shares | target weight | exec date | exec price |
+|---|---|---|---|---|---:|---:|---|---:|
+| BUY | REBALANCE | 513100.SH | 国泰纳斯达克100ETF(QDII) | RANK_IN | 76900 | 20.00% | 2026-06-22 00:00:00 | 2.3107 |
+| SELL | REBALANCE | 512480.SH | 国联安中证全指半导体产品与设备ETF | RANK_OUT | 71800 | 0.00% | 2026-06-22 00:00:00 | 2.5119 |
+
+## Recent Risk Half / Stop Records
+
+| signal | exec | bucket | action | code | name | reason | shares |
+|---|---|---|---|---|---|---|---:|
+| 2026-01-26 00:00:00 | 2026-01-27 00:00:00 | STOP | SELL | 159516.SZ | 国泰中证半导体材料设备主题ETF | STOP_LOSS|RANK_OUT | 53100 |
+| 2026-02-02 00:00:00 | 2026-02-03 00:00:00 | STOP | SELL | 510500.SH | 南方中证500ETF | STOP_LOSS|ATR_STOP|RANK_OUT | 14100 |
+| 2026-02-02 00:00:00 | 2026-02-03 00:00:00 | STOP | SELL | 513310.SH | 华泰柏瑞中证韩交所中韩半导体ETF(QDII) | STOP_LOSS|RANK_OUT | 38400 |
+| 2026-03-03 00:00:00 | 2026-03-04 00:00:00 | STOP | SELL | 513520.SH | 华夏野村日经225ETF(QDII) | STOP_LOSS|RANK_OUT | 57900 |
+| 2026-03-23 00:00:00 | 2026-03-24 00:00:00 | STOP | SELL | 512890.SH | 华泰柏瑞中证红利低波动ETF | ATR_STOP|RANK_OUT | 112600 |
+| 2026-03-23 00:00:00 | 2026-03-24 00:00:00 | STOP | SELL | 159887.SZ | 富国中证800银行ETF | ATR_STOP|RANK_OUT | 105800 |
+| 2026-04-01 00:00:00 | 2026-04-02 00:00:00 | STOP | SELL | 159981.SZ | 建信易盛郑商所能源化工期货ETF | STOP_LOSS|RANK_OUT | 81900 |
+| 2026-04-01 00:00:00 | 2026-04-02 00:00:00 | STOP | SELL | 160723.SZ | 嘉实原油(QDII-LOF-FOF) | STOP_LOSS | 54800 |
+| 2026-05-29 00:00:00 | 2026-06-01 00:00:00 | STOP | SELL | 512480.SH | 国联安中证全指半导体产品与设备ETF | STOP_LOSS|RANK_OUT | 99400 |
+| 2026-05-29 00:00:00 | 2026-06-01 00:00:00 | STOP | SELL | 588200.SH | 嘉实上证科创板芯片ETF | STOP_LOSS|RANK_OUT | 26000 |
+| 2026-06-01 00:00:00 | 2026-06-02 00:00:00 | STOP | SELL | 515880.SH | 国泰中证全指通信设备ETF | STOP_LOSS|RANK_OUT | 42500 |
+| 2026-06-05 00:00:00 | 2026-06-08 00:00:00 | STOP | SELL | 513310.SH | 华泰柏瑞中证韩交所中韩半导体ETF(QDII) | STOP_LOSS|RANK_OUT | 31700 |
+| 2026-06-08 00:00:00 | 2026-06-09 00:00:00 | STOP | SELL | 515880.SH | 国泰中证全指通信设备ETF | STOP_LOSS|RANK_OUT | 34700 |
+| 2026-06-08 00:00:00 | 2026-06-09 00:00:00 | STOP | SELL | 159915.SZ | 易方达创业板ETF | STOP_LOSS|ATR_STOP|RANK_OUT | 44800 |
+| 2026-06-12 00:00:00 | 2026-06-15 00:00:00 | STOP | SELL | 159516.SZ | 国泰中证半导体材料设备主题ETF | STOP_LOSS | 59700 |
+
+## Latest Momentum And Risk Snapshot
+
+| rank | code | name | score | target | held before | target weight | ret std score | amount CV | risk hit | dynamic only |
+|---:|---|---|---:|---|---|---:|---:|---:|---|---|
+| 1 | 513520.SH | 华夏野村日经225ETF(QDII) | 1.9358 | True | True | 20.00% | 0.0262 | 0.3582 | False | False |
+| 2 | 515880.SH | 国泰中证全指通信设备ETF | 1.3906 | True | True | 20.00% | 0.0307 | 0.2182 | False | False |
+| 3 | 159516.SZ | 国泰中证半导体材料设备主题ETF | 0.8416 | True | True | 20.00% | 0.0375 | 0.2150 | True | False |
+| 4 | 513400.SH | 鹏华道琼斯工业平均ETF(QDII) | 0.2681 | True | True | 20.00% | 0.0102 | 0.3791 | False | False |
+| 5 | 513100.SH | 国泰纳斯达克100ETF(QDII) | 0.1681 | True | False | 20.00% | 0.0212 | 0.2605 | False | False |
+| 6 | 512480.SH | 国联安中证全指半导体产品与设备ETF | 0.0548 | False | True |  | 0.0333 | 0.2200 | False | False |
+| 7 | 159949.SZ | 华安创业板50ETF | 0.0260 | False | False |  | 0.0216 | 0.2958 | False | False |
+| 8 | 159682.SZ | 景顺长城创业板50ETF | 0.0241 | False | False |  | 0.0211 | 0.2313 | False | False |
+| 9 | 159915.SZ | 易方达创业板ETF | 0.0148 | False | False |  | 0.0198 | 0.1498 | False | False |
+| 10 | 159995.SZ | 华夏国证半导体芯片ETF | 0.0128 | False | False |  | 0.0329 | 0.2672 | False | False |
+| 11 | 511880.SH | 银华货币ETF-A | 0.0060 | False | False |  | 0.0001 | 0.2183 | False | False |
+| 12 | 511360.SH | 海富通中证短融ETF | 0.0056 | False | False |  | 0.0001 | 0.4115 | False | False |
+| 13 | 513310.SH | 华泰柏瑞中证韩交所中韩半导体ETF(QDII) | 0.0017 | False | False |  | 0.0335 | 0.3356 | False | False |
+| 14 | 159206.SZ | 永赢国证商用卫星通信产业ETF | 0.0000 | False | False |  | 0.0178 | 0.3433 | False | True |
+| 15 | 159870.SZ | 鹏华中证细分化工产业主题ETF | 0.0000 | False | False |  | 0.0192 | 0.3424 | False | False |
+| 16 | 159919.SZ | 嘉实沪深300ETF | 0.0000 | False | False |  | 0.0098 | 0.7636 | False | False |
+| 17 | 510050.SH | 华夏上证50ETF | 0.0000 | False | False |  | 0.0097 | 0.3646 | False | False |
+| 18 | 510300.SH | 华泰柏瑞沪深300ETF | 0.0000 | False | False |  | 0.0098 | 0.4610 | False | True |
+| 19 | 510500.SH | 南方中证500ETF | 0.0000 | False | False |  | 0.0134 | 0.4308 | False | False |
+| 20 | 511380.SH | 博时中证可转债及可交换债券ETF | 0.0000 | False | False |  | 0.0078 | 0.1536 | False | False |
+
+## Files
+
+- account: `etf_loop_account_REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026_h5_20251001_20260625.csv`
+- positions: `etf_loop_positions_REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026_h5_20251001_20260625.csv`
+- signals: `etf_loop_signals_REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026_h5_20251001_20260625.csv`
+- advice: `etf_loop_advice_REPRO_DEFAULTPIT_F2_CAP_MA60_nowarmup_2026_h5_20251001_20260625.csv`

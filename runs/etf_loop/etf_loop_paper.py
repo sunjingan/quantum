@@ -20,8 +20,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from strategies.etf_loop_engine import (  # noqa: E402
     EngineParams,
@@ -41,9 +41,9 @@ from strategies.etf_loop_strategy import (  # noqa: E402
 from strategies.sector_prosperity import SectorProsperityCache, _ETF_DAILY_PROCESS_CACHE  # noqa: E402
 
 
-DEFAULT_OUT = BASE_DIR / "outputs" / "etf_loop_paper"
-DEFAULT_CACHE = BASE_DIR / "data" / "tushare_cache"
-DEFAULT_TOKEN = BASE_DIR / "config" / "tushare_token.txt"
+DEFAULT_OUT = PROJECT_ROOT / "outputs" / "etf_loop_paper"
+DEFAULT_CACHE = PROJECT_ROOT / "data" / "tushare_cache"
+DEFAULT_TOKEN = PROJECT_ROOT / "config" / "tushare_token.txt"
 PIT_NAME = "etf_pool_G2_PIT_monthly.pkl"
 
 
@@ -162,6 +162,79 @@ def load_fund_names(cache_dir: Path) -> dict[str, str]:
     if "ts_code" not in df.columns or "name" not in df.columns:
         return {}
     return dict(zip(df["ts_code"].astype(str), df["name"].fillna("").astype(str), strict=False))
+
+
+def normalize_ts_code(code: str) -> str:
+    """Accept 6-digit, Tushare, or JoinQuant ETF code and return Tushare code."""
+    code = str(code).strip().upper()
+    if not code:
+        raise ValueError("Empty ETF code")
+    if code.endswith(".XSHG") or code.endswith(".XSHE"):
+        return _jq_to_ts(code)
+    if code.endswith(".SH") or code.endswith(".SZ"):
+        return code
+    symbol = "".join(ch for ch in code if ch.isdigit())
+    if len(symbol) != 6:
+        raise ValueError(f"Cannot infer exchange for ETF code: {code}")
+    if symbol.startswith(("5", "58")):
+        return f"{symbol}.SH"
+    if symbol.startswith(("15", "16")):
+        return f"{symbol}.SZ"
+    raise ValueError(f"Cannot infer exchange for ETF code: {code}")
+
+
+def read_manual_pool_file(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path, dtype=str)
+        if df.empty:
+            return []
+        code_col = next((c for c in ["ts_code", "code", "symbol"] if c in df.columns), df.columns[0])
+        raw = df[code_col].dropna().astype(str).tolist()
+    else:
+        raw = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            raw.extend(part.strip() for part in line.replace("，", ",").split(",") if part.strip())
+    return sorted({normalize_ts_code(c) for c in raw})
+
+
+def parse_manual_dynamic_pool(args: argparse.Namespace) -> list[str]:
+    codes: list[str] = []
+    if getattr(args, "manual_dynamic_pool", None):
+        parts = str(args.manual_dynamic_pool).replace("，", ",").split(",")
+        codes.extend(part.strip() for part in parts if part.strip())
+    if getattr(args, "manual_dynamic_pool_file", None):
+        codes.extend(read_manual_pool_file(Path(args.manual_dynamic_pool_file)))
+    return sorted({normalize_ts_code(c) for c in codes})
+
+
+def apply_manual_dynamic_pool(
+    params: EngineParams,
+    signal_date: pd.Timestamp,
+    manual_codes: list[str],
+    mode: str = "merge",
+) -> tuple[EngineParams, set[str], set[str]]:
+    if not manual_codes:
+        return params, set(), set()
+    if params.pit_pools is None:
+        params.pit_pools = {}
+    pool_months = sorted(params.pit_pools.keys())
+    original_active = _get_active_pool(params.pit_pools, pool_months, signal_date) if pool_months else set()
+    manual_set = set(manual_codes)
+    if mode == "replace":
+        effective = manual_set
+    elif mode == "merge":
+        effective = set(original_active) | manual_set
+    else:
+        raise ValueError(f"Unknown manual dynamic pool mode: {mode}")
+    month_key = signal_date.to_period("M").to_timestamp()
+    params.pit_pools = dict(params.pit_pools)
+    params.pit_pools[month_key] = sorted(effective)
+    return params, original_active, effective
 
 
 def build_profile(profile: str, cache_dir: Path, start: str, end: str, initial_cash: float) -> EngineParams:
@@ -482,6 +555,13 @@ def cmd_generate(args: argparse.Namespace) -> None:
     start = history_start(signal_date, args.history_days)
     end = iso(signal_date)
     params = build_profile(account.profile, cache_dir, start, end, account.initial_cash)
+    manual_dynamic_pool = parse_manual_dynamic_pool(args)
+    params, original_dynamic_pool, effective_dynamic_pool = apply_manual_dynamic_pool(
+        params,
+        signal_date,
+        manual_dynamic_pool,
+        args.manual_dynamic_pool_mode,
+    )
     store = build_store(params, token_path, cache_dir, start, end)
     name_map = load_fund_names(cache_dir)
     ranked, targets, weights, active_pool, dynamic_only = select_targets(store, params, signal_date)
@@ -523,10 +603,30 @@ def cmd_generate(args: argparse.Namespace) -> None:
         f"- cash: `{account.cash:.2f}`",
         f"- estimated_nav_at_signal_close: `{nav:.2f}`",
         f"- active_pool_size: `{len(active_pool)}`",
+        f"- manual_dynamic_pool_mode: `{args.manual_dynamic_pool_mode}`",
+        f"- manual_dynamic_pool_size: `{len(manual_dynamic_pool)}`",
+        f"- original_pit_dynamic_pool_size: `{len(original_dynamic_pool)}`",
+        f"- effective_dynamic_pool_size: `{len(effective_dynamic_pool)}`",
         f"- targets: `{', '.join(sorted(targets))}`",
         "",
-        "## Orders",
+        "## Manual Dynamic Pool",
     ]
+    if manual_dynamic_pool:
+        lines.extend(f"- {code} {name_map.get(code, '')}" for code in manual_dynamic_pool)
+    else:
+        lines.append("- not provided")
+    lines.extend([
+        "",
+        "## Effective Dynamic Pool",
+    ])
+    if effective_dynamic_pool:
+        lines.extend(f"- {code} {name_map.get(code, '')}" for code in sorted(effective_dynamic_pool))
+    else:
+        lines.append("- empty")
+    lines.extend([
+        "",
+        "## Orders",
+    ])
     if orders:
         lines.extend(
             f"- {o['action']} {o['ts_code']} {o.get('name', '')} weight={o.get('target_weight', '')} reason={o.get('reason', '')} dynamic={o.get('is_dynamic_only', False)}"
@@ -753,6 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--trade-date", default="next")
     gen.add_argument("--fetch-signal", action="store_true")
     gen.add_argument("--force-fetch", action="store_true")
+    gen.add_argument("--manual-dynamic-pool", help="Comma-separated ETF codes to merge/replace this signal month's PIT dynamic pool.")
+    gen.add_argument("--manual-dynamic-pool-file", help="CSV/text file containing ETF codes for this signal month's PIT dynamic pool.")
+    gen.add_argument("--manual-dynamic-pool-mode", choices=["merge", "replace"], default="merge")
     gen.set_defaults(func=cmd_generate)
 
     exe = sub.add_parser("execute")
@@ -774,6 +877,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_day.add_argument("--force-basic", action="store_true")
     run_day.add_argument("--fetch-signal", action="store_true")
     run_day.add_argument("--force-fetch", action="store_true")
+    run_day.add_argument("--manual-dynamic-pool", help="Comma-separated ETF codes to merge/replace this signal month's PIT dynamic pool.")
+    run_day.add_argument("--manual-dynamic-pool-file", help="CSV/text file containing ETF codes for this signal month's PIT dynamic pool.")
+    run_day.add_argument("--manual-dynamic-pool-mode", choices=["merge", "replace"], default="merge")
     run_day.set_defaults(func=cmd_run_day)
     return p
 

@@ -58,6 +58,28 @@ python runs/etf_loop/etf_loop_paper.py generate --signal-date latest --trade-dat
 python runs/etf_loop/etf_loop_paper.py generate --signal-date 2026-06-26 --trade-date next --fetch-signal
 ```
 
+如果本月动态池需要加入人工推荐池，可以在生成信号时传入 `--manual-dynamic-pool-file`。默认 `merge` 表示“PIT 月度动态池 + 手工池”取并集，只影响当前信号月份的模拟盘信号，不会改历史回测文件。
+
+```bash
+python runs/etf_loop/etf_loop_paper.py generate \
+  --signal-date 2026-06-26 \
+  --trade-date next \
+  --manual-dynamic-pool-file outputs/etf_loop_paper/manual_dynamic_pool_202606.csv \
+  --manual-dynamic-pool-mode merge
+```
+
+也可以直接用逗号传入代码，支持 `588000`、`588000.SH`、`588000.XSHG` 三种格式：
+
+```bash
+python runs/etf_loop/etf_loop_paper.py generate \
+  --signal-date 2026-06-26 \
+  --trade-date next \
+  --manual-dynamic-pool 588000,159995,515070,562500,512880,512890,159928,159941,518880,159930 \
+  --manual-dynamic-pool-mode merge
+```
+
+如果想完全不用 PIT 自动池，只采用这 10 只作为本月动态池，把 `merge` 改成 `replace`。
+
 3. 下一交易日开盘后执行模拟成交：
 
 ```bash
@@ -80,6 +102,60 @@ python runs/etf_loop/etf_loop_paper.py status --date latest
 python runs/etf_loop/etf_loop_paper.py run-day --start 2026-06-26 --end 2026-06-26 --signal-date 2026-06-26 --trade-date next
 ```
 
+带手工动态池的一键命令：
+
+```bash
+python runs/etf_loop/etf_loop_paper.py run-day \
+  --start 2026-06-26 \
+  --end 2026-06-26 \
+  --signal-date 2026-06-26 \
+  --trade-date next \
+  --manual-dynamic-pool-file outputs/etf_loop_paper/manual_dynamic_pool_202606.csv \
+  --manual-dynamic-pool-mode merge
+```
+
+## 第一天模拟盘示例
+
+假设 `2026-06-26` 是上一个交易日收盘，`2026-06-29` 是第一个模拟交易日，初始资金 50 万，采用当前候选 `capped_f2`：
+
+```bash
+cd /Users/jingansun/Desktop/codex/quant
+source activate.sh
+
+python runs/etf_loop/etf_loop_paper.py init --profile capped_f2 --cash 500000 --force
+
+python runs/etf_loop/etf_loop_paper.py update-data --start 2026-06-26 --end 2026-06-26
+
+python runs/etf_loop/etf_loop_paper.py generate \
+  --signal-date 2026-06-26 \
+  --trade-date 2026-06-29 \
+  --manual-dynamic-pool-file outputs/etf_loop_paper/manual_dynamic_pool_202606.csv \
+  --manual-dynamic-pool-mode merge
+```
+
+生成后先看：
+
+```bash
+cat outputs/etf_loop_paper/reports/signal_20260626.md
+```
+
+报告会列出：
+
+- `manual_dynamic_pool_size`: 人工池数量。
+- `original_pit_dynamic_pool_size`: 原 PIT 月度动态池数量。
+- `effective_dynamic_pool_size`: 合并/替换后的本月动态池数量。
+- `targets`: 明日目标持仓。
+- `Orders`: 明日计划卖出/买入。
+
+如果只是影子盘，今天实际不下单，可以不运行 `execute`，只把 `signals/` 和 `orders.csv` 作为当时信号留档。如果要用日线开盘价做轻量模拟成交，在当天日线数据可取到后执行：
+
+```bash
+python runs/etf_loop/etf_loop_paper.py execute --trade-date 2026-06-29 --fetch-trade
+python runs/etf_loop/etf_loop_paper.py status --date 2026-06-29
+```
+
+实盘/严肃模拟盘不建议简单等价为“开盘一次性打满”。更稳妥的操作是：先卖出不在目标持仓内的 ETF，再按目标权重买入；单笔订单不超过执行窗口成交额的 10%，未成交部分保留现金或分批补单；优先使用 `09:35-10:30 VWAP/TWAP` 或 `midday_6x` 这类拆单执行，而不是追求一次性满仓成交。当前脚本的 `execute` 是日线开盘价轻量模拟，不是分钟级撮合引擎。
+
 ## 输出文件
 
 - `outputs/etf_loop_paper/account.json`: 当前现金、持仓、待执行订单。
@@ -88,6 +164,7 @@ python runs/etf_loop/etf_loop_paper.py run-day --start 2026-06-26 --end 2026-06-
 - `outputs/etf_loop_paper/nav.csv`: 每次执行后的现金、市值、组合净值。
 - `outputs/etf_loop_paper/signals/signal_YYYYMMDD.csv`: 信号日排名、得分、目标权重、动态池标记。
 - `outputs/etf_loop_paper/reports/`: 每次信号和执行的 Markdown 摘要。
+- `outputs/etf_loop_paper/manual_dynamic_pool_202606.csv`: 2026-06 示例手工动态池。
 
 ## 策略与成交规则
 

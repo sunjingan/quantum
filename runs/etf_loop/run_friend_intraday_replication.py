@@ -434,7 +434,9 @@ def _weighted_regression_score(prices: np.ndarray) -> dict[str, float] | None:
 def _jq_rank_simple(store: LocalETFIntradayStore, current_date: pd.Timestamp, prev_date: pd.Timestamp) -> list[dict]:
     rows = []
     for code in store.ts_codes:
-        hist = store.close[code].loc[:prev_date].dropna().tail(25) if code in store.close.columns else pd.Series(dtype=float)
+        hist = store.close[code].loc[:prev_date].tail(25) if code in store.close.columns else pd.Series(dtype=float)
+        if hist.isna().any():
+            hist = hist.dropna()
         current_px = store.signal_price(code, current_date)
         if len(hist) < 25 or np.isnan(current_px) or current_px <= 0:
             continue
@@ -455,13 +457,30 @@ def _jq_rank_auto(store: LocalETFIntradayStore, current_date: pd.Timestamp, prev
     min_days = 20
     max_days = 60
     for code in store.ts_codes:
-        if code not in store.close.columns:
+        if code not in store.close.columns or code not in store.high.columns or code not in store.low.columns:
             continue
-        close = store.close[code].loc[:prev_date].dropna().tail(max_days + 10)
-        high = store.high[code].loc[:prev_date].dropna().tail(max_days + 10)
-        low = store.low[code].loc[:prev_date].dropna().tail(max_days + 10)
-        if len(close) < max_days + 10 or len(high) < max_days + 10 or len(low) < max_days + 10:
+        # Keep close/high/low date-aligned, matching JoinQuant attribute_history rows.
+        hist = pd.concat(
+            {
+                "close": store.close[code],
+                "high": store.high[code],
+                "low": store.low[code],
+            },
+            axis=1,
+        ).loc[:prev_date].tail(max_days + 10)
+        if (
+            len(hist) < (max_days + 10)
+            or hist["low"].isna().sum() > max_days
+            or hist["close"].isna().sum() > max_days
+            or hist["high"].isna().sum() > max_days
+        ):
             continue
+        hist = hist.dropna(subset=["close", "high", "low"])
+        if len(hist) < max_days + 10:
+            continue
+        close = hist["close"]
+        high = hist["high"]
+        low = hist["low"]
         long_atr = calculate_atr(high.values, low.values, close.values, max_days)
         short_atr = calculate_atr(high.values, low.values, close.values, min_days)
         if long_atr <= 0 or np.isnan(long_atr) or np.isnan(short_atr):
@@ -735,7 +754,7 @@ def write_report(rows: list[dict], out_dir: Path, start: str, end: str) -> Path:
         "",
         "## Interpretation",
         "",
-        "- `same_0950_close` is optimistic because signal and fill use the same bar close.",
+        "- `same_0950_close` is optimistic and may contain same-minute bar lookahead if the local minute timestamp represents the completed 09:50 bar.",
         "- `same_0951_open` is the first more tradeable T+0 assumption available from 1-minute bars.",
         "- `same_0955_open` is a conservative T+0 assumption available from 5-minute bars.",
         "- `next_day_open` is included only as a latency comparison; it is not the friend's intended execution model.",
@@ -755,6 +774,7 @@ def main() -> None:
     parser.add_argument("--start", default="2020-01-01")
     parser.add_argument("--end", default="2025-12-31")
     parser.add_argument("--signal-time", default="09:50")
+    parser.add_argument("--signal-field", choices=["open", "close"], default="close")
     parser.add_argument("--frequency", choices=["1min", "5min"], default="1min")
     parser.add_argument("--fill-modes", default="same_0950_close,same_0951_open,same_0955_open,next_day_open")
     parser.add_argument("--adjust", choices=["none", "pre"], default="none")
@@ -770,6 +790,7 @@ def main() -> None:
         args.start,
         args.end,
         args.signal_time,
+        args.signal_field,
         adjust=args.adjust,
         frequency=args.frequency,
     )
@@ -813,6 +834,8 @@ def main() -> None:
                 "variant": variant,
                 "ranking_mode": ranking_mode,
                 "frequency": args.frequency,
+                "signal_time": args.signal_time,
+                "signal_field": args.signal_field,
                 "fill_mode": fill_mode,
                 "adjust": args.adjust,
                 "exact_jq_cost": not args.rate_slippage,
